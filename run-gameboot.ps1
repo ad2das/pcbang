@@ -7,8 +7,8 @@
 # so anything it sets (e.g. $ErrorActionPreference) dies with the block.
 & {
 $ErrorActionPreference = 'Stop'
-$pcbFile = 'pcbang-8f789ac6.ps1'
-$pcbSha = '8f789ac67b8f779c4acfdd51d7b0a607538ab41209c8d241af3fe04c3567d68a'
+$pcbFile = 'pcbang-c095e96b.ps1'
+$pcbSha = 'c095e96b741550c857fbf47488488f8851f5b957048896533f56032f99e1febe'
 $Base = 'https://ad2das.github.io/pcbang'
 if ($env:PCB_BASE) { $Base = $env:PCB_BASE }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
