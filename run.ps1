@@ -7,39 +7,60 @@
 # so anything it sets (e.g. $ErrorActionPreference) dies with the block.
 & {
 $ErrorActionPreference = 'Stop'
-$pcbFile = 'pcbang-8629dadd.ps1'
-$pcbSha = '8629dadd78b5cbcc3d8cb65f1a8d724d5e145683a8a9c2a5890371d0cbbc9e1f'
+$pcbFile = 'pcbang-8f789ac6.ps1'
+$pcbSha = '8f789ac67b8f779c4acfdd51d7b0a607538ab41209c8d241af3fe04c3567d68a'
 $Base = 'https://ad2das.github.io/pcbang'
 if ($env:PCB_BASE) { $Base = $env:PCB_BASE }
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
 $pcbUrl = ($Base.TrimEnd('/') + '/' + $pcbFile)
 $pcbDir = Join-Path $env:ProgramData 'pcbang-dl'
-if (-not (Test-Path -LiteralPath $pcbDir)) { New-Item -ItemType Directory -Path $pcbDir -Force | Out-Null }
+if ($env:PCB_DLDIR) { $pcbDir = $env:PCB_DLDIR }
+try { if (-not (Test-Path -LiteralPath $pcbDir)) { New-Item -ItemType Directory -Path $pcbDir -Force -ErrorAction Stop | Out-Null } } catch { }
 $pcbPath = Join-Path $pcbDir $pcbFile
-Write-Host ('downloading ' + $pcbUrl)
-$pcbTmp = $pcbPath + '.part'
-if (Test-Path -LiteralPath $pcbTmp) { Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue }
-try {
-  (New-Object Net.WebClient).DownloadFile($pcbUrl, $pcbTmp)
-} catch {
-  Write-Host ('download failed: ' + $_.Exception.Message)
-  return
+$pcbHave = ''
+if (Test-Path -LiteralPath $pcbPath) {
+  try {
+    $pcbHa0 = [System.Security.Cryptography.SHA256]::Create()
+    try { $pcbHave = (($pcbHa0.ComputeHash([System.IO.File]::ReadAllBytes($pcbPath)) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $pcbHa0.Dispose() }
+  } catch { $pcbHave = '' }
 }
-$pcbGot = ''
-try {
-  $pcbHa = [System.Security.Cryptography.SHA256]::Create()
-  try { $pcbGot = (($pcbHa.ComputeHash([System.IO.File]::ReadAllBytes($pcbTmp)) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $pcbHa.Dispose() }
-} catch {
-  Write-Host ('could not hash the download: ' + $_.Exception.Message)
-  Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue
-  return
+if ($pcbHave -eq $pcbSha) {
+  Write-Host ('using the verified copy ' + $pcbPath)
+} else {
+  Write-Host ('downloading ' + $pcbUrl)
+  $pcbTmp = Join-Path $env:TEMP ($pcbFile + '.part')
+  if (Test-Path -LiteralPath $pcbTmp) { Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue }
+  try {
+    (New-Object Net.WebClient).DownloadFile($pcbUrl, $pcbTmp)
+  } catch {
+    Write-Host ('download failed: ' + $_.Exception.Message)
+    return
+  }
+  $pcbGot = ''
+  try {
+    $pcbHa = [System.Security.Cryptography.SHA256]::Create()
+    try { $pcbGot = (($pcbHa.ComputeHash([System.IO.File]::ReadAllBytes($pcbTmp)) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $pcbHa.Dispose() }
+  } catch {
+    Write-Host ('could not hash the download: ' + $_.Exception.Message)
+    Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue
+    return
+  }
+  if ($pcbGot -ne $pcbSha) {
+    Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue
+    Write-Host 'download mismatch, try again in a few minutes'
+    return
+  }
+  try {
+    Move-Item -LiteralPath $pcbTmp -Destination $pcbPath -Force -ErrorAction Stop
+  } catch {
+    # the shared folder (or an old copy in it) belongs to an elevated session: keep a per-user copy instead
+    $pcbDir = Join-Path $env:TEMP 'pcbang-dl'
+    if (-not (Test-Path -LiteralPath $pcbDir)) { New-Item -ItemType Directory -Path $pcbDir -Force | Out-Null }
+    $pcbPath = Join-Path $pcbDir $pcbFile
+    Move-Item -LiteralPath $pcbTmp -Destination $pcbPath -Force
+    Write-Host ('using a per-user copy ' + $pcbPath)
+  }
 }
-if ($pcbGot -ne $pcbSha) {
-  Remove-Item -LiteralPath $pcbTmp -Force -ErrorAction SilentlyContinue
-  Write-Host 'download mismatch, try again in a few minutes'
-  return
-}
-Move-Item -LiteralPath $pcbTmp -Destination $pcbPath -Force
 $pcbIsAdmin = $false
 try { $pcbIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { $pcbIsAdmin = $false }
 if ($pcbIsAdmin) {

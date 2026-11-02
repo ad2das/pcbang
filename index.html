@@ -18,7 +18,7 @@
 </head>
 <body>
 <h1>PC방 롤(LoL) 지연 최적화</h1>
-<p class="note">재부팅 없이 바로 먹히는 트윅만 적용합니다. 전부 원복할 수 있습니다. PC방은 보통 재부팅하면 복원 프로그램이 원래대로 되돌립니다.</p>
+<p class="note">두 가지가 있습니다: 재부팅 없이 바로 적용(PC방용) / 게임 부팅 모드(재부팅 항목까지 전부, 사무용 PC용). 어느 쪽이든 전부 원복할 수 있습니다.</p>
 
 <h2>쓰는 법</h2>
 <ul>
@@ -27,13 +27,36 @@
   <li>롤은 <b>게임(인게임)을 켜기 전에</b> 실행하세요. 클라이언트는 켜져 있어도 됩니다.</li>
 </ul>
 
-<h2>1. 점검만 (아무것도 안 바꿈)</h2>
+<h2>0. USB 포트 확인 (맨 먼저, 아무것도 안 바꿈)</h2>
+<p class="note">창이 뜹니다. 마우스를 움직이고 키보드를 아무 키나 누르면, 각각 어느 USB 컨트롤러에 꽂혀 있는지 바로 보여 줍니다. <b>빨강</b>이면 다른 포트로 옮겨 꽂아 보세요. 꽂는 즉시 갱신되니 <b>초록</b>이 될 때까지 바꿔 보면 됩니다. 관리자 권한은 필요 없습니다.</p>
+<div class="cmd"><code class="line" id="c5">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/usb.ps1 | iex</code><button data-t="c5">복사</button></div>
+<ul class="note">
+  <li>초록: 가장 좋은 컨트롤러(CPU 직결, 인텔은 메인 컨트롤러)에 직접 꽂힘. 노랑: 허브를 거침(앞면·모니터·키보드 포트) → 뒷면 포트에 직접. 빨강: 칩셋·추가 칩 컨트롤러이거나 블루투스.</li>
+  <li>마우스와 키보드는 같은 컨트롤러에 같이 꽂아도 됩니다. USB 헤드셋은 가능하면 다른 컨트롤러로.</li>
+  <li>포트를 정한 다음에 2-A/2-B를 실행하세요(적용 후 포트를 바꾸면 원복 → 다시 적용).</li>
+</ul>
+
+<h2>1. 점검만 (아무것도 안 바꿈, 재부팅 항목까지 전부 표시)</h2>
 <div class="cmd"><code class="line" id="c1">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/check.ps1 | iex</code><button data-t="c1">복사</button></div>
 
-<h2>2. 적용</h2>
+<h2>2-A. 적용 — 재부팅 없이 (PC방용)</h2>
+<p class="note">재부팅 없이 바로 먹히는 트윅만 적용합니다. 복원 프로그램이 있는 PC방은 이걸 쓰세요.</p>
 <div class="cmd"><code class="line" id="c2">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/run.ps1 | iex</code><button data-t="c2">복사</button></div>
 
+<h2>2-B. 게임 부팅 모드 설치 — 재부팅 포함 (전부, 내 PC용)</h2>
+<p class="note">사무용으로 쓰는 PC에서 게임할 때만 전부 켜는 모드입니다. 평소 부팅(사무)은 아무것도 안 바뀝니다.</p>
+<div class="cmd"><code class="line" id="c4">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/run-gameboot.ps1 | iex</code><button data-t="c4">복사</button></div>
+<ul class="note">
+  <li>설치하면 숨겨진 "게임" 부팅 항목과 바탕화면 아이콘 <b>게임 모드로 재부팅</b>이 생깁니다. 부팅 메뉴는 안 뜹니다.</li>
+  <li>게임하려면 아이콘 클릭 → 게임 부팅으로 한 번 재부팅. 재부팅해야만 먹히는 트윅(타이머 틱, 하이퍼바이저 끔, 커널·TCP·입력·GPU 레지스트리)까지 전부 + 2-A 트윅 전부가 로그온 때 자동 적용됩니다.</li>
+  <li>그냥 재부팅하거나 껐다 켜면 사무 모드로 돌아오고, 로그온 때 2-A 트윅도 자동으로 원복됩니다.</li>
+  <li>게임 부팅 중엔 하이퍼바이저가 꺼져 WSL2·Hyper-V·일부 에뮬레이터가 안 됩니다(사무 부팅은 그대로).</li>
+  <li>BitLocker가 켜진 PC는 모드를 바꿀 때마다 다음 한 번의 부팅 동안 보호를 잠깐 멈춥니다(복구 키 요구 방지).</li>
+  <li>복원 프로그램이 있는 PC방에서는 재부팅하면 다 지워지니 쓰지 마세요(2-A를 쓰세요).</li>
+</ul>
+
 <h2>3. 원복</h2>
+<p class="note">어느 쪽이든 이 한 줄로 되돌립니다. 게임 부팅 모드는 <b>사무 부팅에서</b> 실행하세요(게임 부팅 항목, 아이콘, 자동 작업까지 삭제).</p>
 <div class="cmd"><code class="line" id="c3">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/revert.ps1 | iex</code><button data-t="c3">복사</button></div>
 
 <h2>알아둘 것</h2>
