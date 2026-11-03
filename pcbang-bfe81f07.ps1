@@ -1,0 +1,8577 @@
+# PC-bang gaming tweak kit - built bundle. Do not edit; edit src\ and run build.ps1.
+param(
+  [switch]$Revert,
+  [switch]$DryRun,
+  [switch]$NoNic,
+  [switch]$NoDisplay,
+  [switch]$NoIrq,
+  [switch]$NoGpuIrq,
+  [switch]$NoWatcher,
+  [switch]$NoPause,
+  [switch]$IdleDisable,
+  [switch]$NoIdleDisable,
+  [string[]]$SchemeCandidates = $null,
+  [string]$DxPrefsPath = '',
+  [string]$DxPrefsName = '',
+  [string]$StateDir = "$env:ProgramData\pcbang-tune",
+  [string]$GameName = 'League of Legends',
+  [string[]]$SideNames = @('LeagueClientUx','LeagueClientUxRender','Riot Client','RiotClientServices','RiotClientCrashHandler'),
+  # The game inherits its parent's affinity at birth, so the launcher is put on the game
+  # mask BEFORE it spawns the game - the watcher's 2 s loop would only fix it afterwards.
+  # Priority is deliberately not touched for these.
+  [string[]]$ParentNames = @('LeagueClient'),
+  [switch]$WatcherLoop,
+  [uint64]$GameMask = 0,
+  [uint64]$SideMask = 0,
+  # Test-only: point the LoL cfg step at a throw-away Config dir instead of the real
+  # C:\Riot Games\...\Config one.  Empty means "use the real install".
+  [string]$LolCfgDir = '',
+  [switch]$DotSource,
+  # GAME boot mode (W-RB3): -GameBoot installs the hidden boot entry + icon + tasks,
+  # -GameReboot is what the icon runs, -GameStartup/-GameLogon are the two scheduled
+  # tasks (the startup one runs as SYSTEM) and -GameChild marks the child process the
+  # logon step starts.
+  [switch]$GameBoot,
+  [switch]$GameReboot,
+  [switch]$GameStartup,
+  [switch]$GameLogon,
+  [switch]$GameChild,
+  [switch]$NoRebootPrompt,
+  # USB port check window (W-USB2): reads the device tree and raw input only, so it
+  # runs before the self-elevation below and never asks for admin rights.
+  [switch]$UsbScan,
+  [int]$UsbScanTestSec = 0,
+  [string]$UsbScanShot = '',
+  # One window for the whole kit (W-GUI1).  Test-only: -GuiTestSec closes it after N s,
+  # -GuiShot saves a picture of it, -GuiTestAction clicks one button ('check' only),
+  # -GuiLogOut writes the log box and the summary to a file when it closes.
+  [switch]$Gui,
+  [int]$GuiTestSec = 0,
+  [string]$GuiShot = '',
+  [string]$GuiTestAction = '',
+  [string]$GuiLogOut = '',
+  # Test-only seams: an exported BCD copy instead of the system store, a throw-away
+  # registry root instead of the HKLM boot keys, an injected interface GUID, the booted
+  # entry id, a short task-name prefix, a shortcut directory, and a file the reboot call
+  # writes to instead of restarting.
+  [string]$BcdStore = '',
+  [string]$BootRegRoot = '',
+  [string]$BootIfGuid = '',
+  [string]$BootedId = '',
+  [string]$TaskPrefix = 'pcbang-game',
+  [string]$ShortcutDir = '',
+  [string]$RebootCmdFile = ''
+)
+
+# ==== begin nvidia.ps1 ====
+# W-PCB2 - NVIDIA DRS module for the PC-bang kit.
+# Pure Windows PowerShell 5.1, single file, ASCII only, no exe, no network.
+#
+# Public API (W-PCB1 codes against this contract):
+#   Get-PcbNvLolState            -> Available / Profile / Error / Settings[{Id,Name,Value,UserSet}]
+#   Set-PcbNvLol                 -> Ok / Before / After / Error
+#   Restore-PcbNvLol -Before <s> -> Ok / After / Error
+#
+# Nothing here throws: every failure comes back as Available=$false / Ok=$false with an Error string.
+# Private helpers are all prefixed PcbNv.
+#
+# Driver facts proven on this box (Windows 11, driver 32.0.15.8253, nvapi64.dll):
+#   nvapi_QueryInterface(uint id) -> function pointer; DRS calls are cdecl.
+#   NVDRS_SETTING is 12320 bytes, version word = 12320 | (1 << 16) = 0x00013020.
+#   +4 name (UTF-16), +4100 settingId, +4108 settingLocation, +4112 isCurrentPredefined,
+#   +4116 isPredefinedValid, +4124 predefined u32, +8220 current u32.
+#   An override owned by the profile is settingLocation 0 with isCurrentPredefined 0.
+#   DestroySession crashes the process if called twice on one handle, so the session
+#   wrapper closes exactly once and never touches a handle it already released.
+
+$script:PcbNvProfileName = 'League of Legends'
+$script:PcbNvDllDefault = 'nvapi64.dll'
+
+# The four latency settings, in contract order. Target is the value Set-PcbNvLol writes.
+# W-NV2: the driver stores 0x00000000 in both V-Sync rows, which is in no advertised value
+# list, so the two rows below write advertised values instead (see available.csv:505-513).
+$script:PcbNvLolSettings = @(
+    [pscustomobject]@{
+        Id     = [uint32]::Parse('007BA09E', 'HexNumber')
+        Name   = 'Maximum pre-rendered frames'
+        Symbol = 'PRERENDERLIMIT'
+        Target = [uint32]1
+    },
+    [pscustomobject]@{
+        Id     = [uint32]::Parse('1057EB71', 'HexNumber')
+        Name   = 'Power management mode'
+        Symbol = 'PREFERRED_PSTATE'
+        Target = [uint32]1
+    },
+    [pscustomobject]@{
+        Id     = [uint32]::Parse('00A879CF', 'HexNumber')
+        Name   = 'Vertical Sync'
+        Symbol = 'VSYNCMODE'
+        Target = [uint32]::Parse('08416747', 'HexNumber')
+    },
+    [pscustomobject]@{
+        Id     = [uint32]::Parse('005A375C', 'HexNumber')
+        Name   = 'Vertical Sync Tear Control'
+        Symbol = 'VSYNCTEARCONTROL'
+        Target = [uint32]::Parse('96861077', 'HexNumber')
+    },
+    # The other 12 settings the home PC writes to the same profile (drsapply.cpp:60-75,
+    # W-INV2: all 16 live, every value below is either a listed value of that id or its
+    # default, so the driver accepts each one).
+    [pscustomobject]@{ Id = [uint32]::Parse('0064B541', 'HexNumber'); Name = 'Preferred refresh rate';           Symbol = 'REFRESHRATE';        Target = [uint32]1 },
+    [pscustomobject]@{ Id = [uint32]::Parse('20C1221E', 'HexNumber'); Name = 'Threaded optimization';            Symbol = 'THREADEDOPTIMIZATION'; Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('201F619F', 'HexNumber'); Name = 'Buffer-flipping mode';             Symbol = 'FLIPMODE';           Target = [uint32]1 },
+    [pscustomobject]@{ Id = [uint32]::Parse('20FDD1F9', 'HexNumber'); Name = 'Triple buffering';                 Symbol = 'TRIPLEBUFFERING';    Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('00198FFF', 'HexNumber'); Name = 'Shader Cache';                     Symbol = 'SHADERCACHE';        Target = [uint32]1 },
+    [pscustomobject]@{ Id = [uint32]::Parse('101E61A9', 'HexNumber'); Name = 'Anisotropic filtering setting';    Symbol = 'ANISOTROPICFILTER';  Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('10D773D2', 'HexNumber'); Name = 'Antialiasing - Setting';           Symbol = 'AA_SETTING';         Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('107EFC5B', 'HexNumber'); Name = 'Antialiasing - Mode';              Symbol = 'AA_MODE';            Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('00E73211', 'HexNumber'); Name = 'Anisotropic sample optimization';  Symbol = 'ANISOSAMPLEOPT';     Target = [uint32]1 },
+    [pscustomobject]@{ Id = [uint32]::Parse('00CE2691', 'HexNumber'); Name = 'Texture filtering - Quality';      Symbol = 'TEXFILTERQUALITY';   Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('0019BB68', 'HexNumber'); Name = 'Negative LOD bias';                Symbol = 'NEGATIVELODBIAS';    Target = [uint32]0 },
+    [pscustomobject]@{ Id = [uint32]::Parse('10835002', 'HexNumber'); Name = 'Frame Rate Limiter';               Symbol = 'FRAMERATELIMITER';   Target = [uint32]0 }
+)
+
+$script:PcbNvCs = @'
+using System;
+using System.Runtime.InteropServices;
+
+public sealed class PcbNvReadResult
+{
+    public uint Status;
+    public uint Value;
+    public bool UserSet;
+    public string Name;
+    public string Error;
+}
+
+public sealed class PcbNvSession : IDisposable
+{
+    public IntPtr Handle;
+    public IntPtr Profile;
+    public string Error;
+    private bool closed;
+
+    public bool Ok { get { return this.Error == null && this.Handle != IntPtr.Zero; } }
+
+    // Exactly once. A second DestroySession on the same handle faults the process.
+    public void Close()
+    {
+        if (this.closed) { return; }
+        this.closed = true;
+        IntPtr h = this.Handle;
+        this.Handle = IntPtr.Zero;
+        this.Profile = IntPtr.Zero;
+        if (h != IntPtr.Zero) { PcbNvApi.Destroy(h); }
+    }
+
+    public void Dispose() { this.Close(); }
+}
+
+public static class PcbNvApi
+{
+    public const int SettingSize = 12320;
+    public const uint StatusNotFound = 0xFFFFFF60u;
+
+    private const uint IdInitialize = 0x0150E828u;
+    private const uint IdCreateSession = 0x0694D52Eu;
+    private const uint IdLoadSettings = 0x375DBD6Bu;
+    private const uint IdSaveSettings = 0xFCBC7E14u;
+    private const uint IdFindProfileByName = 0x7E4A9A0Bu;
+    private const uint IdGetSetting = 0x73BF8338u;
+    private const uint IdSetSetting = 0x577DD202u;
+    private const uint IdDeleteProfileSetting = 0xE4A26362u;
+    private const uint IdGetBaseProfile = 0xDA8466A0u;
+    private const uint IdDestroySession = 0xDAD9CFF8u;
+
+    private const int OffVersion = 0;
+    private const int OffName = 4;
+    private const int OffSettingId = 4100;
+    private const int OffLocation = 4108;
+    private const int OffIsCurrentPredefined = 4112;
+    private const int OffIsPredefinedValid = 4116;
+    private const int OffPredefinedValue = 4124;
+    private const int OffCurrentValue = 8220;
+
+    private const string ProfileName = "League of Legends";
+
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadLibraryW(string file);
+
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
+    private static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate IntPtr DelQueryInterface(uint id);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelInitialize();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelCreateSession(out IntPtr session);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelSessionOp(IntPtr session);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelFindProfile(IntPtr session, [MarshalAs(UnmanagedType.LPWStr)] string name, out IntPtr profile);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelGetSetting(IntPtr session, IntPtr profile, uint id, IntPtr setting);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelSetSetting(IntPtr session, IntPtr profile, IntPtr setting);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelDeleteSetting(IntPtr session, IntPtr profile, uint id);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate uint DelGetBaseProfile(IntPtr session, out IntPtr profile);
+
+    private static string loadedDll;
+    private static string loadError;
+    private static DelInitialize fnInitialize;
+    private static DelCreateSession fnCreateSession;
+    private static DelSessionOp fnLoadSettings;
+    private static DelSessionOp fnSaveSettings;
+    private static DelSessionOp fnDestroySession;
+    private static DelFindProfile fnFindProfile;
+    private static DelGetSetting fnGetSetting;
+    private static DelSetSetting fnSetSetting;
+    private static DelDeleteSetting fnDeleteSetting;
+    private static DelGetBaseProfile fnGetBaseProfile;
+
+    private static string StatusText(string name, uint status)
+    {
+        return string.Format("{0} failed 0x{1:X8}", name, status);
+    }
+
+    private static string Missing(string name, uint id)
+    {
+        return string.Format("nvapi_QueryInterface({0}) is null for 0x{1:X8}", name, id);
+    }
+
+    private static void Zero(IntPtr buffer)
+    {
+        for (int i = 0; i < SettingSize; i += 4) { Marshal.WriteInt32(buffer, i, 0); }
+    }
+
+    // Returns null on success, otherwise the reason the API cannot be used.
+    public static string EnsureLoaded(string dllName)
+    {
+        if (dllName == null || dllName.Length == 0) { dllName = "nvapi64.dll"; }
+        if (loadedDll == dllName) { return loadError; }
+
+        loadedDll = dllName;
+        loadError = null;
+        fnInitialize = null;
+        fnCreateSession = null;
+        fnLoadSettings = null;
+        fnSaveSettings = null;
+        fnDestroySession = null;
+        fnFindProfile = null;
+        fnGetSetting = null;
+        fnSetSetting = null;
+        fnDeleteSetting = null;
+        fnGetBaseProfile = null;
+
+        try
+        {
+            IntPtr module = LoadLibraryW(dllName);
+            if (module == IntPtr.Zero) { loadError = "no nvapi64.dll"; return loadError; }
+
+            IntPtr qi = GetProcAddress(module, "nvapi_QueryInterface");
+            if (qi == IntPtr.Zero) { loadError = "no nvapi64.dll"; return loadError; }
+
+            DelQueryInterface query = (DelQueryInterface)Marshal.GetDelegateForFunctionPointer(qi, typeof(DelQueryInterface));
+            IntPtr p;
+
+            p = query(IdInitialize);
+            if (p == IntPtr.Zero) { loadError = Missing("Initialize", IdInitialize); return loadError; }
+            fnInitialize = (DelInitialize)Marshal.GetDelegateForFunctionPointer(p, typeof(DelInitialize));
+
+            p = query(IdCreateSession);
+            if (p == IntPtr.Zero) { loadError = Missing("CreateSession", IdCreateSession); return loadError; }
+            fnCreateSession = (DelCreateSession)Marshal.GetDelegateForFunctionPointer(p, typeof(DelCreateSession));
+
+            p = query(IdLoadSettings);
+            if (p == IntPtr.Zero) { loadError = Missing("LoadSettings", IdLoadSettings); return loadError; }
+            fnLoadSettings = (DelSessionOp)Marshal.GetDelegateForFunctionPointer(p, typeof(DelSessionOp));
+
+            p = query(IdSaveSettings);
+            if (p == IntPtr.Zero) { loadError = Missing("SaveSettings", IdSaveSettings); return loadError; }
+            fnSaveSettings = (DelSessionOp)Marshal.GetDelegateForFunctionPointer(p, typeof(DelSessionOp));
+
+            p = query(IdFindProfileByName);
+            if (p == IntPtr.Zero) { loadError = Missing("FindProfileByName", IdFindProfileByName); return loadError; }
+            fnFindProfile = (DelFindProfile)Marshal.GetDelegateForFunctionPointer(p, typeof(DelFindProfile));
+
+            p = query(IdGetSetting);
+            if (p == IntPtr.Zero) { loadError = Missing("GetSetting", IdGetSetting); return loadError; }
+            fnGetSetting = (DelGetSetting)Marshal.GetDelegateForFunctionPointer(p, typeof(DelGetSetting));
+
+            p = query(IdSetSetting);
+            if (p == IntPtr.Zero) { loadError = Missing("SetSetting", IdSetSetting); return loadError; }
+            fnSetSetting = (DelSetSetting)Marshal.GetDelegateForFunctionPointer(p, typeof(DelSetSetting));
+
+            p = query(IdDeleteProfileSetting);
+            if (p == IntPtr.Zero) { loadError = Missing("DeleteProfileSetting", IdDeleteProfileSetting); return loadError; }
+            fnDeleteSetting = (DelDeleteSetting)Marshal.GetDelegateForFunctionPointer(p, typeof(DelDeleteSetting));
+
+            p = query(IdGetBaseProfile);
+            if (p == IntPtr.Zero) { loadError = Missing("GetBaseProfile", IdGetBaseProfile); return loadError; }
+            fnGetBaseProfile = (DelGetBaseProfile)Marshal.GetDelegateForFunctionPointer(p, typeof(DelGetBaseProfile));
+
+            p = query(IdDestroySession);
+            if (p == IntPtr.Zero) { loadError = Missing("DestroySession", IdDestroySession); return loadError; }
+            fnDestroySession = (DelSessionOp)Marshal.GetDelegateForFunctionPointer(p, typeof(DelSessionOp));
+        }
+        catch (Exception ex)
+        {
+            loadError = "nvapi load failed: " + ex.Message;
+        }
+        return loadError;
+    }
+
+    public static void Destroy(IntPtr handle)
+    {
+        if (fnDestroySession == null || handle == IntPtr.Zero) { return; }
+        try { fnDestroySession(handle); } catch { }
+    }
+
+    // Initialize -> CreateSession -> LoadSettings -> FindProfileByName.
+    public static PcbNvSession Open()
+    {
+        PcbNvSession s = new PcbNvSession();
+        try
+        {
+            if (fnInitialize == null) { s.Error = loadError != null ? loadError : "nvapi not loaded"; return s; }
+
+            uint status = fnInitialize();
+            if (status != 0u) { s.Error = StatusText("Initialize", status); return s; }
+
+            IntPtr handle;
+            status = fnCreateSession(out handle);
+            if (status != 0u) { s.Error = StatusText("CreateSession", status); return s; }
+            s.Handle = handle;
+
+            status = fnLoadSettings(handle);
+            if (status != 0u) { s.Error = StatusText("LoadSettings", status); s.Close(); return s; }
+
+            IntPtr profile;
+            status = fnFindProfile(handle, ProfileName, out profile);
+            if (status != 0u) { s.Error = StatusText("FindProfileByName", status); s.Close(); return s; }
+            if (profile == IntPtr.Zero) { s.Error = "profile not found: " + ProfileName; s.Close(); return s; }
+            s.Profile = profile;
+        }
+        catch (Exception ex)
+        {
+            s.Error = "session failed: " + ex.Message;
+            s.Close();
+        }
+        return s;
+    }
+
+    // Initialize -> CreateSession -> LoadSettings -> GetBaseProfile.
+    // W-NV2: the Base profile is not addressable by name, so it needs its own open path.
+    public static PcbNvSession OpenBase()
+    {
+        PcbNvSession s = new PcbNvSession();
+        try
+        {
+            if (fnInitialize == null) { s.Error = loadError != null ? loadError : "nvapi not loaded"; return s; }
+
+            uint status = fnInitialize();
+            if (status != 0u) { s.Error = StatusText("Initialize", status); return s; }
+
+            IntPtr handle;
+            status = fnCreateSession(out handle);
+            if (status != 0u) { s.Error = StatusText("CreateSession", status); return s; }
+            s.Handle = handle;
+
+            status = fnLoadSettings(handle);
+            if (status != 0u) { s.Error = StatusText("LoadSettings", status); s.Close(); return s; }
+
+            if (fnGetBaseProfile == null) { s.Error = "GetBaseProfile not bound"; s.Close(); return s; }
+
+            IntPtr profile;
+            status = fnGetBaseProfile(handle, out profile);
+            if (status != 0u) { s.Error = StatusText("GetBaseProfile", status); s.Close(); return s; }
+            if (profile == IntPtr.Zero) { s.Error = "base profile not found"; s.Close(); return s; }
+            s.Profile = profile;
+        }
+        catch (Exception ex)
+        {
+            s.Error = "base session failed: " + ex.Message;
+            s.Close();
+        }
+        return s;
+    }
+
+    // A setting that is not present in the profile reports NVAPI_SETTING_NOT_FOUND,
+    // which is a valid answer: value 0, not user set, no error.
+    public static PcbNvReadResult Read(PcbNvSession s, uint id)
+    {
+        PcbNvReadResult r = new PcbNvReadResult();
+        r.Value = 0u;
+        r.UserSet = false;
+        r.Name = "";
+        if (s == null || !s.Ok) { r.Error = (s != null && s.Error != null) ? s.Error : "no session"; return r; }
+
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            buffer = Marshal.AllocHGlobal(SettingSize);
+            Zero(buffer);
+            Marshal.WriteInt32(buffer, OffVersion, unchecked((int)(SettingSize | (1 << 16))));
+            Marshal.WriteInt32(buffer, OffSettingId, unchecked((int)id));
+
+            uint status = fnGetSetting(s.Handle, s.Profile, id, buffer);
+            r.Status = status;
+            if (status == StatusNotFound) { return r; }
+            if (status != 0u) { r.Error = StatusText("GetSetting", status); return r; }
+
+            r.Value = (uint)Marshal.ReadInt32(buffer, OffCurrentValue);
+            uint location = (uint)Marshal.ReadInt32(buffer, OffLocation);
+            uint currentPredefined = (uint)Marshal.ReadInt32(buffer, OffIsCurrentPredefined);
+            r.UserSet = (location == 0u && currentPredefined == 0u);
+
+            string name = Marshal.PtrToStringUni(new IntPtr(buffer.ToInt64() + OffName));
+            if (name != null) { r.Name = name; }
+        }
+        catch (Exception ex)
+        {
+            r.Error = "read failed: " + ex.Message;
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+        }
+        return r;
+    }
+
+    public static string Write(PcbNvSession s, uint id, uint value)
+    {
+        if (s == null || !s.Ok) { return (s != null && s.Error != null) ? s.Error : "no session"; }
+
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            buffer = Marshal.AllocHGlobal(SettingSize);
+            Zero(buffer);
+            Marshal.WriteInt32(buffer, OffVersion, unchecked((int)(SettingSize | (1 << 16))));
+            Marshal.WriteInt32(buffer, OffSettingId, unchecked((int)id));
+            Marshal.WriteInt32(buffer, OffLocation, 0);
+            Marshal.WriteInt32(buffer, OffIsCurrentPredefined, 0);
+            Marshal.WriteInt32(buffer, OffIsPredefinedValid, 0);
+            Marshal.WriteInt32(buffer, OffPredefinedValue, 0);
+            Marshal.WriteInt32(buffer, OffCurrentValue, unchecked((int)value));
+
+            uint status = fnSetSetting(s.Handle, s.Profile, buffer);
+            if (status != 0u) { return StatusText("SetSetting", status); }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return "set failed: " + ex.Message;
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+        }
+    }
+
+    // Removing an override that is not there is not a failure: the setting is already
+    // at the driver default, which is exactly the requested end state.
+    public static string Remove(PcbNvSession s, uint id)
+    {
+        if (s == null || !s.Ok) { return (s != null && s.Error != null) ? s.Error : "no session"; }
+        try
+        {
+            uint status = fnDeleteSetting(s.Handle, s.Profile, id);
+            if (status == 0u || status == StatusNotFound) { return null; }
+            return StatusText("DeleteProfileSetting", status);
+        }
+        catch (Exception ex)
+        {
+            return "delete failed: " + ex.Message;
+        }
+    }
+
+    public static string Save(PcbNvSession s)
+    {
+        if (s == null || !s.Ok) { return (s != null && s.Error != null) ? s.Error : "no session"; }
+        try
+        {
+            uint status = fnSaveSettings(s.Handle);
+            if (status != 0u) { return StatusText("SaveSettings", status); }
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return "save failed: " + ex.Message;
+        }
+    }
+}
+'@
+
+function PcbNv-EnsureType {
+    if ('PcbNvApi' -as [type]) { return '' }
+    try {
+        Add-Type -TypeDefinition $script:PcbNvCs -ErrorAction Stop | Out-Null
+        return ''
+    } catch {
+        return ('Add-Type failed: ' + $_.Exception.Message)
+    }
+}
+
+# Returns '' when the DRS entry points are usable, otherwise the reason.
+function PcbNv-Load {
+    param([string]$DllName = $script:PcbNvDllDefault)
+
+    $typeError = PcbNv-EnsureType
+    if ($typeError) { return $typeError }
+
+    try {
+        $result = [PcbNvApi]::EnsureLoaded($DllName)
+    } catch {
+        return ('nvapi load failed: ' + $_.Exception.Message)
+    }
+    if ($null -eq $result) { return '' }
+    return [string]$result
+}
+
+function PcbNv-NewState {
+    param(
+        [bool]$Available,
+        [string]$Profile,
+        [string]$ErrorMessage,
+        $Settings
+    )
+
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($spec in $script:PcbNvLolSettings) {
+        $value = [uint32]0
+        $userSet = [bool]$false
+        $name = [string]$spec.Name
+
+        foreach ($entry in @($Settings)) {
+            if ($null -eq $entry) { continue }
+            if ($null -eq $entry.Id) { continue }
+            if ([uint32]$entry.Id -ne [uint32]$spec.Id) { continue }
+            $value = [uint32]$entry.Value
+            if ($entry.UserSet) { $userSet = [bool]$true }
+            if ($entry.Name) { $name = [string]$entry.Name }
+            break
+        }
+
+        $null = $rows.Add([pscustomobject]@{
+            Id      = [uint32]$spec.Id
+            Name    = [string]$name
+            Value   = [uint32]$value
+            UserSet = [bool]$userSet
+        })
+    }
+
+    return [pscustomobject]@{
+        Available = [bool]$Available
+        Profile   = [string]$Profile
+        Error     = [string]$ErrorMessage
+        Settings  = @($rows.ToArray())
+    }
+}
+
+# Finds one setting row in a state object, live or rehydrated from JSON. $null when absent.
+function PcbNv-FindSetting {
+    param($State, $Id)
+
+    if ($null -eq $State) { return $null }
+    if ($null -eq $State.Settings) { return $null }
+    foreach ($entry in @($State.Settings)) {
+        if ($null -eq $entry) { continue }
+        if ($null -eq $entry.Id) { continue }
+        if ([uint32]$entry.Id -eq [uint32]$Id) { return $entry }
+    }
+    return $null
+}
+
+function PcbNv-ReadState {
+    param([string]$DllName = $script:PcbNvDllDefault)
+
+    $loadError = PcbNv-Load -DllName $DllName
+    if ($loadError) {
+        return (PcbNv-NewState -Available $false -Profile $script:PcbNvProfileName -ErrorMessage $loadError)
+    }
+
+    $session = $null
+    $rows = New-Object System.Collections.ArrayList
+    $readError = ''
+    $profileMissing = ''
+
+    try {
+        $session = [PcbNvApi]::Open()
+        if (-not $session.Ok) {
+            $profileMissing = [string]$session.Error
+        } else {
+            foreach ($spec in $script:PcbNvLolSettings) {
+                $result = [PcbNvApi]::Read($session, [uint32]$spec.Id)
+                if ($result.Error -and -not $readError) { $readError = [string]$result.Error }
+                $null = $rows.Add([pscustomobject]@{
+                    Id      = [uint32]$spec.Id
+                    Name    = [string]$result.Name
+                    Value   = [uint32]$result.Value
+                    UserSet = [bool]$result.UserSet
+                })
+            }
+        }
+    } catch {
+        $readError = 'read failed: ' + $_.Exception.Message
+    } finally {
+        if ($null -ne $session) { $session.Close() }
+    }
+
+    if ($profileMissing) {
+        return (PcbNv-NewState -Available $false -Profile $script:PcbNvProfileName -ErrorMessage $profileMissing)
+    }
+    return (PcbNv-NewState -Available $true -Profile $script:PcbNvProfileName -ErrorMessage $readError -Settings @($rows.ToArray()))
+}
+
+# Applies a list of {Mode='Set'|'Delete'; Id; Value} actions in one session, then saves once.
+# Returns '' on success, otherwise the error text.
+function PcbNv-Apply {
+    param(
+        [string]$DllName = $script:PcbNvDllDefault,
+        $Actions
+    )
+
+    $loadError = PcbNv-Load -DllName $DllName
+    if ($loadError) { return $loadError }
+
+    $session = $null
+    $result = ''
+    try {
+        $session = [PcbNvApi]::Open()
+        if (-not $session.Ok) {
+            $result = [string]$session.Error
+        } else {
+            foreach ($action in @($Actions)) {
+                if ($null -eq $action) { continue }
+                if ([string]$action.Mode -eq 'Delete') {
+                    $step = [PcbNvApi]::Remove($session, [uint32]$action.Id)
+                } else {
+                    $step = [PcbNvApi]::Write($session, [uint32]$action.Id, [uint32]$action.Value)
+                }
+                if ($step) { $result = [string]$step; break }
+            }
+            if (-not $result) {
+                $saved = [PcbNvApi]::Save($session)
+                if ($saved) { $result = [string]$saved }
+            }
+        }
+    } catch {
+        $result = 'apply failed: ' + $_.Exception.Message
+    } finally {
+        if ($null -ne $session) { $session.Close() }
+    }
+    return [string]$result
+}
+
+# Reads the Base profile rows for the given ids. Base is not addressable by name, so this
+# uses the GetBaseProfile path. Returns one {Id,Name,Value,UserSet} row per id, or throws-free
+# error text via the Error property.
+function PcbNv-ReadBaseSettings {
+    param(
+        [string]$DllName = $script:PcbNvDllDefault,
+        [uint32[]]$Ids = @()
+    )
+
+    $loadError = PcbNv-Load -DllName $DllName
+    if ($loadError) { return [pscustomobject]@{ Ok = [bool]$false; Error = [string]$loadError; Rows = @() } }
+
+    $session = $null
+    $rows = New-Object System.Collections.ArrayList
+    $readError = ''
+    try {
+        $session = [PcbNvApi]::OpenBase()
+        if (-not $session.Ok) {
+            $readError = [string]$session.Error
+        } else {
+            foreach ($id in $Ids) {
+                $result = [PcbNvApi]::Read($session, [uint32]$id)
+                if ($result.Error -and -not $readError) { $readError = [string]$result.Error }
+                $null = $rows.Add([pscustomobject]@{
+                    Id      = [uint32]$id
+                    Name    = [string]$result.Name
+                    Value   = [uint32]$result.Value
+                    UserSet = [bool]$result.UserSet
+                })
+            }
+        }
+    } catch {
+        $readError = 'base read failed: ' + $_.Exception.Message
+    } finally {
+        if ($null -ne $session) { $session.Close() }
+    }
+
+    return [pscustomobject]@{
+        Ok    = [bool](-not $readError)
+        Error = [string]$readError
+        Rows  = @($rows.ToArray())
+    }
+}
+
+# Applies Set/Delete actions to the Base profile in one session, then saves once.
+# Same action shape as PcbNv-Apply.
+function PcbNv-ApplyBase {
+    param(
+        [string]$DllName = $script:PcbNvDllDefault,
+        $Actions
+    )
+
+    $loadError = PcbNv-Load -DllName $DllName
+    if ($loadError) { return $loadError }
+
+    $session = $null
+    $result = ''
+    try {
+        $session = [PcbNvApi]::OpenBase()
+        if (-not $session.Ok) {
+            $result = [string]$session.Error
+        } else {
+            foreach ($action in @($Actions)) {
+                if ($null -eq $action) { continue }
+                if ([string]$action.Mode -eq 'Delete') {
+                    $step = [PcbNvApi]::Remove($session, [uint32]$action.Id)
+                } else {
+                    $step = [PcbNvApi]::Write($session, [uint32]$action.Id, [uint32]$action.Value)
+                }
+                if ($step) { $result = [string]$step; break }
+            }
+            if (-not $result) {
+                $saved = [PcbNvApi]::Save($session)
+                if ($saved) { $result = [string]$saved }
+            }
+        }
+    } catch {
+        $result = 'base apply failed: ' + $_.Exception.Message
+    } finally {
+        if ($null -ne $session) { $session.Close() }
+    }
+    return [string]$result
+}
+
+function PcbNv-DescribeState {
+    param($State)
+
+    if ($null -eq $State) { return 'state=<null>' }
+    $parts = New-Object System.Collections.ArrayList
+    foreach ($spec in $script:PcbNvLolSettings) {
+        $entry = PcbNv-FindSetting -State $State -Id $spec.Id
+        if ($null -eq $entry) {
+            $null = $parts.Add(('{0}=<missing>' -f $spec.Symbol))
+        } else {
+            $null = $parts.Add(('{0}={1}/UserSet={2}' -f $spec.Symbol, [uint32]$entry.Value, ([bool]$entry.UserSet)))
+        }
+    }
+    return ('Available={0} Error="{1}" {2}' -f ([bool]$State.Available), [string]$State.Error, ($parts -join ' '))
+}
+
+function Get-PcbNvLolState {
+    param([string]$DllName = $script:PcbNvDllDefault)
+
+    try {
+        return (PcbNv-ReadState -DllName $DllName)
+    } catch {
+        return (PcbNv-NewState -Available $false -Profile $script:PcbNvProfileName -ErrorMessage ('unexpected: ' + $_.Exception.Message))
+    }
+}
+
+function Set-PcbNvLol {
+    param([string]$DllName = $script:PcbNvDllDefault)
+
+    $before = PcbNv-ReadState -DllName $DllName
+    if (-not $before.Available) {
+        return [pscustomobject]@{ Ok = [bool]$false; Before = $before; After = $before; Error = [string]$before.Error }
+    }
+
+    $actions = New-Object System.Collections.ArrayList
+    foreach ($spec in $script:PcbNvLolSettings) {
+        $null = $actions.Add(@{ Mode = 'Set'; Id = [uint32]$spec.Id; Value = [uint32]$spec.Target })
+    }
+
+    $errorText = PcbNv-Apply -DllName $DllName -Actions @($actions.ToArray())
+    $after = PcbNv-ReadState -DllName $DllName
+
+    $ok = [bool]$false
+    if (-not $errorText -and $after.Available) {
+        $ok = [bool]$true
+        foreach ($spec in $script:PcbNvLolSettings) {
+            $entry = PcbNv-FindSetting -State $after -Id $spec.Id
+            if ($null -eq $entry) { $ok = [bool]$false; break }
+            if ([uint32]$entry.Value -ne [uint32]$spec.Target) { $ok = [bool]$false; break }
+        }
+    }
+    if (-not $ok -and -not $errorText) { $errorText = 'verify failed' }
+
+    return [pscustomobject]@{
+        Ok     = [bool]$ok
+        Before = $before
+        After  = $after
+        Error  = [string]$errorText
+    }
+}
+
+function Restore-PcbNvLol {
+    param(
+        $Before,
+        [string]$DllName = $script:PcbNvDllDefault
+    )
+
+    if ($null -eq $Before) {
+        $state = PcbNv-ReadState -DllName $DllName
+        return [pscustomobject]@{ Ok = [bool]$false; After = $state; Error = [string]'Before state missing' }
+    }
+
+    $actions = New-Object System.Collections.ArrayList
+    foreach ($spec in $script:PcbNvLolSettings) {
+        $entry = PcbNv-FindSetting -State $Before -Id $spec.Id
+        if ($null -ne $entry -and $entry.UserSet) {
+            $null = $actions.Add(@{ Mode = 'Set'; Id = [uint32]$spec.Id; Value = [uint32]$entry.Value })
+        } else {
+            $null = $actions.Add(@{ Mode = 'Delete'; Id = [uint32]$spec.Id })
+        }
+    }
+
+    $errorText = PcbNv-Apply -DllName $DllName -Actions @($actions.ToArray())
+    $after = PcbNv-ReadState -DllName $DllName
+
+    $ok = [bool]$false
+    if (-not $errorText -and $after.Available) { $ok = [bool]$true }
+    if (-not $ok -and -not $errorText) { $errorText = 'restore failed' }
+
+    return [pscustomobject]@{
+        Ok    = [bool]$ok
+        After = $after
+        Error = [string]$errorText
+    }
+}
+
+# ==== end nvidia.ps1 ====
+
+# ==== begin irq.ps1 ====
+# src\irq.ps1 - live IRQ-affinity pinning for the PC-bang kit (W-PCB3).
+# Dot-sourced by W-PCB1's main script. ASCII only, stock Windows PowerShell 5.1, elevated.
+#
+# Public functions:
+#   Get-PcbIrqTargets
+#     -> @([pscustomobject]@{ Role='mouse-xhci'|'kbd-xhci'|'gpu'|'nic'; InstanceId; Name })
+#   Set-PcbIrqPins -IrqMask <uint64> [-Targets <list>] [-NoRestart] [-DryRun]
+#     -> [pscustomobject]@{ Ok=[bool]; Before=@(<per target record>);
+#                           Rows=@([pscustomobject]@{ Step;Item;Before;After;Status }); Error=[string] }
+#   Restore-PcbIrqPins -Before <records> [-NoRestart]
+#     -> same shape, Before empty
+#
+# Per-target record: @{ Role; InstanceId; KeyExisted=[bool]; DevicePolicy=<int|$null>; Override=<int[]|$null> }
+#
+# Where the pin lives:
+#   HKLM\SYSTEM\CurrentControlSet\Enum\<InstanceId>\Device Parameters\Interrupt Management\Affinity Policy
+#     DevicePolicy          DWORD  4
+#     AssignmentSetOverride BINARY 8 bytes little-endian of ([uint64]1 -shl cpu)
+# A written pin reaches the running kernel only when the device is restarted
+# (pnputil /restart-device for xHCI/GPU, Restart-NetAdapter for a NIC). No reboot needed.
+#
+# Older Windows 10 builds have no 'pnputil /restart-device'. When pnputil exits with
+# anything other than 0 (0 = done, 3010 = reboot required) the xHCI/GPU path falls back to
+# Disable-PnpDevice + Enable-PnpDevice, then the same Status polling / enable retries.
+# The restart row Status names the path that ran: 'OK' or 'OK (fallback disable/enable)'.
+# $script:PcbIrqForceFallback = $true forces the fallback without calling pnputil at all
+# (tests only).
+#
+# Never throws: every failure is reported as a row with Status 'FAIL: <msg>'.
+
+$script:PcbIrqTail = 'Device Parameters\Interrupt Management\Affinity Policy'
+$script:PcbIrqEnableAttempts = 3
+$script:PcbIrqPollSeconds = 20
+$script:PcbIrqForceFallback = $false
+$script:PcbIrqAdapterSource = $null
+# Tests only: a fake list of input devices (objects with Class, InstanceId, PciAncestor)
+# so the parent walk and the restart never touch this PC. $null = live Get-PnpDevice.
+$script:PcbIrqInputSource = $null
+# Tests only: a fake display-device list (objects with InstanceId + FriendlyName).
+$script:PcbIrqDisplaySource = $null
+# Tests only: OS build for Get-PcbIrqRestartMethod. $null = this machine's real build.
+$script:PcbIrqOsBuild = $null
+# pnputil /restart-device first shipped in Windows 10 2004 (build 19041).
+$script:PcbIrqPnpUtilMinBuild = 19041
+
+# Registry roots. Every path below is built from these two strings, so a unit test
+# can point them at HKCU and exercise the whole apply/restore path without writing
+# anywhere under the real Enum or Class tree. The kit itself keeps the HKLM roots.
+$script:PcbIrqEnumRoot = 'HKLM:\SYSTEM\CurrentControlSet\Enum'
+$script:PcbIrqClassRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class'
+# Tests only: scriptblocks that replace the live restart / the status poll, so a
+# test can run a full apply, a rollback and a restore without touching a device.
+# $null = the real Restart-PcbIrqDevice / Wait-PcbIrqDeviceOk.
+$script:PcbIrqRestartImpl = $null
+$script:PcbIrqPollImpl = $null
+# Tests only: hashtable InstanceId -> DEVPKEY_Device_Driver ('{guid}\0000'), the
+# class-key subkey of a device. $null = ask the live PnP property store.
+$script:PcbIrqDriverMap = $null
+# Tests only: hastable InstanceId -> DEVPKEY_Device_Parent. $null = live property store.
+$script:PcbIrqParentMap = $null
+# Tests only: fake USB child list (objects with InstanceId + Parent) for the root
+# hub lookup. $null = walk the live USB-class devices.
+$script:PcbIrqUsbChildSource = $null
+# Tests only: InstanceId -> the interrupt numbers the device currently owns
+# (an array of numbers). $null = ask Win32_PnPAllocatedResource / Win32_IRQResource.
+# Used after a restart to say whether the device is on MSI or on line interrupts.
+$script:PcbIrqIrqSource = $null
+
+# Home tweak values (latencyfix\irq-apply.ps1:25, p56.ps1:11, usbpower.ps1:25-27,
+# b38.ps1:8-11, nv-extreme.ps1:6-15, nv-final.ps1:34). All DWORD except where noted.
+$script:PcbIrqDevParamsTail = 'Device Parameters'
+$script:PcbIrqMsiTail = 'Device Parameters\Interrupt Management\MessageSignaledInterruptProperties'
+# IRQ_PRIORITY is Undefined 0 / Low 1 / Normal 2 / High 3 - there is no member 4,
+# so mouse and keyboard get 3 (the value home's 4 would have to mean) and the rest
+# keep home's value.
+$script:PcbIrqDevicePriority = @{
+    'mouse-xhci' = 3
+    'kbd-xhci'   = 3
+    'gpu'        = 3
+    'nic'        = 2
+}
+# p56.ps1:16 on the xHCI controller itself.
+$script:PcbIrqUsbControllerValues = @(
+    @{ Name = 'UsbLinkPowerManagement'; Value = 0 },
+    @{ Name = 'AllowIdleIrpInD3'; Value = 0 }
+)
+# usbpower.ps1:25-27 on the USB device that owns the input report.
+$script:PcbIrqUsbDeviceValues = @(
+    @{ Name = 'EnhancedPowerManagementEnabled'; Value = 0 },
+    @{ Name = 'AllowIdleIrpInD3'; Value = 0 },
+    @{ Name = 'SelectiveSuspendEnabled'; Value = 0 }
+)
+# nv-extreme.ps1:6-15 supersedes b38.ps1, nv-final.ps1:34 adds DisableWriteCombining.
+$script:PcbIrqNvClassValues = @(
+    @{ Name = 'PerfLevelSrc'; Value = 0x2222 },
+    @{ Name = 'EnableDynamicPstate'; Value = 0 },
+    @{ Name = 'DisableDynamicPstate'; Value = 1 },
+    @{ Name = 'PowerMizerEnable'; Value = 1 },
+    @{ Name = 'PowerMizerLevel'; Value = 1 },
+    @{ Name = 'PowerMizerLevelAC'; Value = 1 },
+    @{ Name = 'RMHdcpKeyglobZero'; Value = 1 },
+    @{ Name = 'DisableVideoPort'; Value = 0 },
+    @{ Name = 'DisableWriteCombining'; Value = 0 }
+)
+$script:PcbIrqNvVendor = 'PCI\VEN_10DE'
+
+function Write-PcbIrqOut {
+    param([string]$Text)
+    [Console]::Out.WriteLine($Text)
+}
+
+function New-PcbIrqRow {
+    param([string]$Step, [string]$Item, [string]$Before, [string]$After, [string]$Status, [string]$Detail = '')
+    return [pscustomobject]@{
+        Step   = $Step
+        Item   = $Item
+        Before = $Before
+        After  = $After
+        Status = $Status
+        Detail = $Detail
+    }
+}
+
+function Get-PcbIrqIrqNumbers {
+    # The interrupt numbers one device owns right now. A message-signaled vector is
+    # reported by WMI as an IRQ number above 0x7FFFFFFF (a negative int32); a classic
+    # line interrupt is a small positive number. $script:PcbIrqIrqSource lets a unit
+    # test inject the list (a scriptblock taking the InstanceId, returning numbers).
+    param([string]$InstanceId)
+    $out = @()
+    if ($script:PcbIrqIrqSource -ne $null) {
+        try {
+            foreach ($v in @(& $script:PcbIrqIrqSource $InstanceId)) {
+                if ($v -eq $null) { continue }
+                $out += [uint64]$v
+            }
+        } catch { }
+        return $out
+    }
+    try {
+        $wql = "DeviceID='" + ($InstanceId -replace '\\', '\\') + "'"
+        $ent = Get-CimInstance -ClassName Win32_PnPEntity -Filter $wql -ErrorAction Stop
+        if ($ent -ne $null) {
+            $res = @(Get-CimAssociatedInstance -InputObject $ent -Association Win32_PnPAllocatedResource -ResultClassName Win32_IRQResource -ErrorAction SilentlyContinue)
+            foreach ($r in $res) {
+                if ($r -eq $null -or $r.IRQNumber -eq $null) { continue }
+                $out += [uint64]$r.IRQNumber
+            }
+        }
+    } catch { }
+    return $out
+}
+
+function Get-PcbIrqInterruptType {
+    # 'msi=yes' when at least one vector is a message-signaled one. The restart that
+    # wrote MSISupported is what decides this, so it is read after the restart.
+    param([string]$InstanceId)
+    $nums = @(Get-PcbIrqIrqNumbers $InstanceId)
+    $msi = 0
+    $line = 0
+    foreach ($n in $nums) {
+        if ([uint64]$n -gt [uint64]0x7FFFFFFF) { $msi = $msi + 1 } else { $line = $line + 1 }
+    }
+    if ($nums.Count -eq 0) {
+        return [pscustomobject]@{ Msi = $false; MsiCount = 0; LineCount = 0; Count = 0; Text = 'msi=? (no interrupt resource readable)' }
+    }
+    $on = 'no'
+    if ($msi -gt 0) { $on = 'yes' }
+    return [pscustomobject]@{
+        Msi      = ($msi -gt 0)
+        MsiCount = $msi
+        LineCount = $line
+        Count    = $nums.Count
+        Text     = 'msi=' + $on + ' (' + $msi + ' msi / ' + $line + ' line vector(s))'
+    }
+}
+
+function Get-PcbIrqEnumKey {
+    param([string]$InstanceId)
+    return ($script:PcbIrqEnumRoot + '\' + $InstanceId)
+}
+
+function Get-PcbIrqApKey {
+    param([string]$InstanceId)
+    return ((Get-PcbIrqEnumKey $InstanceId) + '\' + $script:PcbIrqTail)
+}
+
+function Get-PcbIrqMsiKey {
+    param([string]$InstanceId)
+    return ((Get-PcbIrqEnumKey $InstanceId) + '\' + $script:PcbIrqMsiTail)
+}
+
+function Get-PcbIrqDeviceParent {
+    param([string]$InstanceId)
+    if ($script:PcbIrqParentMap -ne $null) {
+        $k = [string]$InstanceId
+        if ($script:PcbIrqParentMap.ContainsKey($k)) { return [string]$script:PcbIrqParentMap[$k] }
+        return ''
+    }
+    try {
+        $prop = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction SilentlyContinue
+        if ($prop -ne $null -and $prop.Data -ne $null) { return [string]$prop.Data }
+    } catch { }
+    return ''
+}
+
+function Get-PcbIrqDriverSubkey {
+    # The class-key instance of a device: '{4d36e968-...}\0000' from DEVPKEY_Device_Driver.
+    # Not always \0000, so it is always asked for. $script:PcbIrqDriverMap lets a test
+    # inject the mapping; $null = the live property store.
+    param([string]$InstanceId)
+    if ($script:PcbIrqDriverMap -ne $null) {
+        $k = [string]$InstanceId
+        if ($script:PcbIrqDriverMap.ContainsKey($k)) { return [string]$script:PcbIrqDriverMap[$k] }
+        return ''
+    }
+    try {
+        $prop = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_Driver' -ErrorAction SilentlyContinue
+        if ($prop -ne $null -and $prop.Data -ne $null) { return [string]$prop.Data }
+    } catch { }
+    return ''
+}
+
+function Get-PcbIrqUsbAncestors {
+    # Every USB\* ancestor of a HID device: the interface node (USB\VID_x&PID_y&MI_nn)
+    # and the composite device under it. Home wrote its USB power values to both.
+    param([string]$InstanceId)
+    $out = New-Object System.Collections.ArrayList
+    $cur = $InstanceId
+    for ($hop = 0; $hop -lt 16; $hop++) {
+        $cur = Get-PcbIrqDeviceParent $cur
+        if ([string]::IsNullOrWhiteSpace($cur)) { break }
+        if ($cur -like 'PCI\*') { break }
+        if ($cur -like 'USB\*') {
+            $hit = $false
+            foreach ($x in $out) { if ([string]$x -eq $cur) { $hit = $true } }
+            if (-not $hit) { [void]$out.Add($cur) }
+        }
+    }
+    return $out
+}
+
+function Get-PcbIrqUsbChildren {
+    # USB-class devices whose parent is this controller: the USB\ROOT_HUB* node.
+    param([string]$InstanceId)
+    $out = New-Object System.Collections.ArrayList
+    if ($script:PcbIrqUsbChildSource -ne $null) {
+        foreach ($d in @($script:PcbIrqUsbChildSource)) {
+            if ($null -eq $d) { continue }
+            if ([string]$d.Parent -ne $InstanceId) { continue }
+            [void]$out.Add([string]$d.InstanceId)
+        }
+        return $out
+    }
+    try {
+        foreach ($d in @(Get-PnpDevice -Class USB -PresentOnly -ErrorAction SilentlyContinue)) {
+            if ($null -eq $d) { continue }
+            if ((Get-PcbIrqDeviceParent ([string]$d.InstanceId)) -ne $InstanceId) { continue }
+            [void]$out.Add([string]$d.InstanceId)
+        }
+    } catch { }
+    return $out
+}
+
+function Get-PcbIrqExtraPlan {
+    # Everything Set-PcbIrqPins writes besides the pin, in write order, as
+    # @{ Path; Name; Value; Kind }. Paths are absolute and built from the two roots.
+    param([string]$Role, [string]$InstanceId)
+    $plan = New-Object System.Collections.ArrayList
+    $enumKey = Get-PcbIrqEnumKey $InstanceId
+
+    # 1. MSI on every pinned device (home: GPU, NIC, both xHCI).
+    [void]$plan.Add(@{ Path = ($enumKey + '\' + $script:PcbIrqMsiTail); Name = 'MSISupported'; Value = 1; Kind = 'DWord' })
+
+    # 2. DevicePriority next to the affinity pin. 4 is not an IRQ_PRIORITY member.
+    $prio = $null
+    if ($script:PcbIrqDevicePriority.ContainsKey($Role)) { $prio = $script:PcbIrqDevicePriority[$Role] }
+    if ($prio -ne $null) {
+        $apKey = Get-PcbIrqApKey $InstanceId
+        [void]$plan.Add(@{ Path = $apKey; Name = 'DevicePriority'; Value = [int]$prio; Kind = 'DWord' })
+    }
+
+    # 3. USB power: the controller's link-power value, then the root hub and every
+    #    USB node that owns an input device of this controller. The children
+    #    re-enumerate with the controller restart, so they pick the values up.
+    if ($Role -eq 'mouse-xhci' -or $Role -eq 'kbd-xhci') {
+        $dpKey = $enumKey + '\' + $script:PcbIrqDevParamsTail
+        foreach ($v in $script:PcbIrqUsbControllerValues) {
+            [void]$plan.Add(@{ Path = $dpKey; Name = $v.Name; Value = [int]$v.Value; Kind = 'DWord' })
+        }
+        $usbIds = New-Object System.Collections.ArrayList
+        foreach ($hub in @(Get-PcbIrqUsbChildren $InstanceId)) { [void]$usbIds.Add([string]$hub) }
+        foreach ($cls in @('Mouse','Keyboard')) {
+            foreach ($d in @(Get-PcbIrqInputDevices -Class $cls)) {
+                if ($null -eq $d) { continue }
+                $iid = [string]$d.InstanceId
+                if ([string]::IsNullOrWhiteSpace($iid)) { continue }
+                $anc = $null
+                if ($script:PcbIrqInputSource -ne $null) { $anc = [string]$d.PciAncestor } else { $anc = Get-PcbIrqPciAncestor -InstanceId $iid }
+                if ($anc -ne $InstanceId) { continue }
+                foreach ($u in @(Get-PcbIrqUsbAncestors $iid)) {
+                    $hit = $false
+                    foreach ($x in $usbIds) { if ([string]$x -eq [string]$u) { $hit = $true } }
+                    if (-not $hit) { [void]$usbIds.Add([string]$u) }
+                }
+            }
+        }
+        foreach ($u in $usbIds) {
+            $p = $script:PcbIrqEnumRoot + '\' + $u + '\' + $script:PcbIrqDevParamsTail
+            foreach ($v in $script:PcbIrqUsbDeviceValues) {
+                [void]$plan.Add(@{ Path = $p; Name = $v.Name; Value = [int]$v.Value; Kind = 'DWord' })
+            }
+        }
+    }
+
+    # 4. NVIDIA class key. Only for a GeForce card - no other vendor gets these.
+    if ($Role -eq 'gpu' -and $InstanceId -like ($script:PcbIrqNvVendor + '*')) {
+        $sub = Get-PcbIrqDriverSubkey $InstanceId
+        if (-not [string]::IsNullOrWhiteSpace($sub)) {
+            $clsKey = $script:PcbIrqClassRoot + '\' + $sub
+            foreach ($v in $script:PcbIrqNvClassValues) {
+                [void]$plan.Add(@{ Path = $clsKey; Name = $v.Name; Value = [int]$v.Value; Kind = 'DWord' })
+            }
+        }
+    }
+
+    return $plan
+}
+
+function Read-PcbIrqExtraState {
+    # @{ Existed; Value; Kind } for one value. Absent -> Existed=$false, Value=$null.
+    # Kind is the real registry kind name (DWord / String / Binary / ...), so a value
+    # that was already there comes back with its own type, not with ours.
+    param([string]$Path, [string]$Name)
+    $st = @{ Existed = $false; Value = $null; Kind = $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $st }
+    try {
+        $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $raw = $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        if ($raw -eq $null) { return $st }
+        $kind = 'DWord'
+        try { $kind = [string]$key.GetValueKind($Name) } catch { $kind = 'DWord' }
+        $st.Existed = $true
+        if ($kind -eq 'Binary') {
+            $b = @()
+            foreach ($x in @($raw)) { $b += [int]$x }
+            $st.Value = $b
+        } elseif ($kind -eq 'MultiString') {
+            $st.Value = @($raw)
+        } else {
+            $st.Value = $raw
+        }
+        $st.Kind = $kind
+    } catch { }
+    return $st
+}
+
+function Write-PcbIrqValue {
+    # $Kind 'DWord' / 'String' / 'Binary' / 'QWord' / ...; $null value -> delete the value.
+    param([string]$Path, [string]$Name, $Kind, $Value)
+    if ($Value -eq $null) {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
+        }
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { $null = New-Item -Path $Path -Force }
+    if ($Kind -eq 'Binary') {
+        $bytes = [byte[]](@($Value) | ForEach-Object { [byte][int]$_ })
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType Binary -Value $bytes -Force
+    } elseif ($Kind -eq 'MultiString') {
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType MultiString -Value ([string[]]@($Value)) -Force
+    } elseif ($Kind -eq 'QWord') {
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType QWord -Value ([uint64]$Value) -Force
+    } elseif ($Kind -eq 'String' -or $Kind -eq 'ExpandString') {
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType String -Value ([string]$Value) -Force
+    } else {
+        $null = New-ItemProperty -LiteralPath $Path -Name $Name -PropertyType DWord -Value ([int]$Value) -Force
+    }
+}
+
+function Write-PcbIrqExtraPlan {
+    # Writes the plan, returns the record entries (before state per value) plus the
+    # list of keys the kit created, so Restore can put everything back.
+    param($Plan)
+    $entries = New-Object System.Collections.ArrayList
+    $created = New-Object System.Collections.ArrayList
+    $seenKey = @{}
+    foreach ($p in @($Plan)) {
+        if ($p -eq $null) { continue }
+        $path = [string]$p.Path
+        $name = [string]$p.Name
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $keyExisted = Test-Path -LiteralPath $path
+        if (-not $keyExisted) {
+            # Record every level that does not exist yet, so Restore can remove the
+            # whole chain again (deepest first) once it is empty.
+            $cur = $path
+            while (-not [string]::IsNullOrWhiteSpace($cur)) {
+                if ((Test-Path -LiteralPath $cur)) { break }
+                if (-not $seenKey.ContainsKey($cur)) {
+                    $seenKey[$cur] = $true
+                    [void]$created.Add($cur)
+                }
+                $parent = Split-Path -Parent $cur
+                if ([string]::IsNullOrWhiteSpace($parent)) { break }
+                if ($parent -eq $script:PcbIrqEnumRoot -or $parent -eq $script:PcbIrqClassRoot) { break }
+                if ($parent -eq 'HKCU:\Software' -or $parent -eq 'HKCU:' -or $parent -eq 'HKLM:\SYSTEM') { break }
+                $cur = $parent
+            }
+        }
+        $st = Read-PcbIrqExtraState $path $name
+        # A value that was already there must come back with its own registry kind,
+        # not with the kind the kit wanted to write.
+        $kind = [string]$p.Kind
+        if ($st.Existed -eq $true -and -not [string]::IsNullOrWhiteSpace([string]$st.Kind)) { $kind = [string]$st.Kind }
+        [void]$entries.Add([pscustomobject]@{
+                Path   = $path
+                Name   = $name
+                Kind   = $kind
+                Existed = [bool]$st.Existed
+                Before = $st.Value
+                After  = $p.Value
+            })
+        Write-PcbIrqValue $path $name ([string]$p.Kind) $p.Value
+    }
+    return [pscustomobject]@{ Entries = @($entries.ToArray()); CreatedKeys = @($created.ToArray()) }
+}
+
+function Test-PcbIrqKeyEmpty {
+    # $true when the key exists and holds neither values nor subkeys.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $items = @(Get-ChildItem -LiteralPath $Path -ErrorAction SilentlyContinue)
+        if ($items.Count -gt 0) { return $false }
+    } catch { return $false }
+    $n = 0
+    try {
+        $props = @(Get-ItemProperty -LiteralPath $Path -ErrorAction SilentlyContinue)
+        if ($props.Count -gt 0) {
+            foreach ($pr in $props[0].PSObject.Properties) { if ($pr.Name -notlike 'PS*') { $n++ } }
+        }
+    } catch { return $false }
+    return ($n -eq 0)
+}
+
+function Remove-PcbIrqEmptyKeyChain {
+    # Removes $Path and every empty ancestor above it, so a key the kit created for
+    # this device disappears completely. Stops at the two injected roots and at the
+    # first ancestor that still holds something.
+    param([string]$Path)
+    $cur = $Path
+    for ($hop = 0; $hop -lt 16; $hop++) {
+        if ([string]::IsNullOrWhiteSpace($cur)) { break }
+        $stop = $false
+        foreach ($r in @([string]$script:PcbIrqEnumRoot, [string]$script:PcbIrqClassRoot)) {
+            if ([string]::IsNullOrWhiteSpace($r)) { continue }
+            if ($cur.Length -le $r.Length) { $stop = $true }
+        }
+        if ($stop) { break }
+        if (-not (Test-Path -LiteralPath $cur)) { break }
+        if (-not (Test-PcbIrqKeyEmpty $cur)) { break }
+        try { Remove-Item -LiteralPath $cur -Force -ErrorAction Stop } catch { break }
+        $cur = Split-Path -Parent $cur
+    }
+}
+
+function Restore-PcbIrqExtras {
+    # Writes every recorded before state back: a value that was absent is deleted, a
+    # pre-seeded value comes back with its value. Keys the kit created are removed
+    # again when they end up empty.
+    param($Entries, $CreatedKeys)
+    $bad = New-Object System.Collections.ArrayList
+    foreach ($e in @($Entries)) {
+        if ($e -eq $null) { continue }
+        try {
+            if ($e.Existed -eq $true) {
+                Write-PcbIrqValue ([string]$e.Path) ([string]$e.Name) ([string]$e.Kind) $e.Before
+            } else {
+                Write-PcbIrqValue ([string]$e.Path) ([string]$e.Name) ([string]$e.Kind) $null
+            }
+        } catch {
+            [void]$bad.Add('restore ' + $e.Name + ': ' + $_.Exception.Message)
+        }
+    }
+    # Deepest key first, and each removal walks back up its ancestors: one key can hold
+    # another key the kit created (Device Parameters -> Interrupt Management -> ...),
+    # so an ancestor only becomes empty after its last child is gone.
+    $keys = @($CreatedKeys | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    $keys = @($keys | Sort-Object -Property @{ Expression = { ([string]$_).Length }; Descending = $true })
+    foreach ($k in $keys) {
+        $k = [string]$k
+        try {
+            Remove-PcbIrqEmptyKeyChain $k
+        } catch {
+            [void]$bad.Add('restore key ' + $k + ': ' + $_.Exception.Message)
+        }
+    }
+    return @($bad.ToArray())
+}
+
+function Format-PcbIrqExtra {
+    # 'Name=<absent>->1' / 'Name=0->1'
+    param($Entry)
+    $b = '<absent>'
+    if ($Entry.Existed -eq $true -and $Entry.Before -ne $null) { $b = '' + $Entry.Before }
+    return ([string]$Entry.Name + '=' + $b + '->' + ('' + $Entry.After))
+}
+
+
+function Get-PcbIrqBytes {
+    param([int]$Cpu)
+    # 8 little-endian bytes of 1<<cpu. -shl on [int] wraps at 32 bits, so force [uint64].
+    return [BitConverter]::GetBytes([uint64]([uint64]1 -shl $Cpu))
+}
+
+function Format-PcbIrqPin {
+    param($DevicePolicy, $Override)
+    $dp = 'DP=<missing>'
+    if ($DevicePolicy -ne $null) { $dp = 'DP=' + [int]$DevicePolicy }
+    $ov = 'OV=<missing>'
+    if ($Override -ne $null) {
+        $parts = @()
+        foreach ($b in @($Override)) { $parts += [int]$b }
+        $ov = 'OV=[' + ($parts -join ',') + ']'
+    }
+    return ($dp + ' ' + $ov)
+}
+
+function Read-PcbIrqPin {
+    param([string]$InstanceId)
+    $rec = [pscustomobject]@{
+        Role         = $null
+        InstanceId   = $InstanceId
+        KeyExisted   = $false
+        DevicePolicy = $null
+        Override     = $null
+    }
+    try {
+        $path = Get-PcbIrqApKey $InstanceId
+        $key = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($key -ne $null) { $rec.KeyExisted = $true }
+        $props = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($props -ne $null) {
+            $p = $props.PSObject.Properties['DevicePolicy']
+            if ($p -ne $null -and $p.Value -ne $null) { $rec.DevicePolicy = [int]$p.Value }
+            $o = $props.PSObject.Properties['AssignmentSetOverride']
+            if ($o -ne $null -and $o.Value -ne $null) {
+                $bytes = @()
+                foreach ($b in $o.Value) { $bytes += [int]$b }
+                $rec.Override = $bytes
+            }
+        }
+    } catch {
+        $rec.KeyExisted = $false
+        $rec.DevicePolicy = $null
+        $rec.Override = $null
+    }
+    return $rec
+}
+
+function Write-PcbIrqPinValues {
+    param([string]$InstanceId, $DevicePolicy, $Override)
+    # DevicePolicy $null and Override $null -> remove both values, keep the key.
+    $path = Get-PcbIrqApKey $InstanceId
+    if (-not (Test-Path -LiteralPath $path)) { $null = New-Item -Path $path -Force }
+    if ($DevicePolicy -eq $null) {
+        Remove-ItemProperty -LiteralPath $path -Name 'DevicePolicy' -ErrorAction SilentlyContinue
+    } else {
+        $null = New-ItemProperty -LiteralPath $path -Name 'DevicePolicy' -PropertyType DWord -Value ([int]$DevicePolicy) -Force
+    }
+    if ($Override -eq $null) {
+        Remove-ItemProperty -LiteralPath $path -Name 'AssignmentSetOverride' -ErrorAction SilentlyContinue
+    } else {
+        $bytes = [byte[]](@($Override) | ForEach-Object { [byte][int]$_ })
+        $null = New-ItemProperty -LiteralPath $path -Name 'AssignmentSetOverride' -PropertyType Binary -Value $bytes -Force
+    }
+    return (Format-PcbIrqPin (Read-PcbIrqPin $InstanceId).DevicePolicy (Read-PcbIrqPin $InstanceId).Override)
+}
+
+function Get-PcbIrqCpuList {
+    param([uint64]$IrqMask)
+    $list = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt 64; $i++) {
+        if (([uint64]$IrqMask -band ([uint64]1 -shl $i)) -ne [uint64]0) { [void]$list.Add([int]$i) }
+    }
+    return $list
+}
+
+function Get-PcbIrqCpuForRole {
+    # 0 bits -> $null (everything skipped); 1 bit -> b0 for every role;
+    # 2+ bits -> mouse-xhci on b1, gpu and nic on b0.
+    param([uint64]$IrqMask, [string]$Role)
+    $cpus = Get-PcbIrqCpuList $IrqMask
+    if ($cpus.Count -eq 0) { return $null }
+    if ($cpus.Count -eq 1) { return [int]$cpus[0] }
+    if ($Role -eq 'mouse-xhci' -or $Role -eq 'kbd-xhci') { return [int]$cpus[1] }
+    return [int]$cpus[0]
+}
+
+function Get-PcbIrqPciAncestor {
+    # Walk DEVPKEY_Device_Parent from a device instance id up to the first PCI\*
+    # ancestor. Returns $null when the device hangs off no PCI bus (PS/2, Bluetooth).
+    param([string]$InstanceId)
+    $cur = $InstanceId
+    if ([string]::IsNullOrWhiteSpace($cur)) { return $null }
+    for ($hop = 0; $hop -lt 16; $hop++) {
+        $parent = Get-PcbIrqDeviceParent $cur
+        if ([string]::IsNullOrWhiteSpace($parent)) { return $null }
+        $cur = $parent
+        if ($cur -like 'PCI\*') { return $cur }
+    }
+    return $null
+}
+
+function Get-PcbIrqInputDevices {
+    # The input devices that own a PCI controller. $script:PcbIrqInputSource lets a unit
+    # test inject a fake list (objects with Class, InstanceId, PciAncestor); $null means
+    # the live Get-PnpDevice walk.
+    param([string]$Class)
+    if ($script:PcbIrqInputSource -ne $null) {
+        return @($script:PcbIrqInputSource | Where-Object { $null -ne $_ -and [string]$_.Class -eq $Class })
+    }
+    try {
+        return @(Get-PnpDevice -Class $Class -PresentOnly -ErrorAction SilentlyContinue)
+    } catch {
+        return @()
+    }
+}
+
+function Get-PcbIrqTargets {
+    $out = New-Object System.Collections.ArrayList
+    $seenMouse = @{}
+    $injected = ($script:PcbIrqInputSource -ne $null)
+
+    # mouse-xhci / kbd-xhci: for every present Mouse- and Keyboard-class device walk
+    # DEVPKEY_Device_Parent up to the first PCI\* ancestor; unique controllers only.
+    # Keyboards come second on purpose: a controller that already carries the mouse
+    # keeps Role 'mouse-xhci', and a keyboard-only controller is the one that gets
+    # 'kbd-xhci', so no controller is ever added twice.
+    foreach ($cls in @('Mouse','Keyboard')) {
+        $role = 'mouse-xhci'
+        if ($cls -eq 'Keyboard') { $role = 'kbd-xhci' }
+        try {
+            $devs = @(Get-PcbIrqInputDevices -Class $cls)
+            foreach ($d in $devs) {
+                if ($null -eq $d) { continue }
+                $iid = [string]$d.InstanceId
+                if ([string]::IsNullOrWhiteSpace($iid)) { continue }
+                $found = $null
+                if ($injected) { $found = [string]$d.PciAncestor } else { $found = Get-PcbIrqPciAncestor -InstanceId $iid }
+                if ([string]::IsNullOrWhiteSpace($found)) { continue }
+                $k = $found.ToLowerInvariant()
+                if ($seenMouse.ContainsKey($k)) { continue }
+                $seenMouse[$k] = $true
+                $nm = ''
+                if (-not $injected) {
+                    try {
+                        $ctrl = Get-PnpDevice -InstanceId $found -ErrorAction SilentlyContinue
+                        if ($ctrl -ne $null) { $nm = [string]$ctrl.FriendlyName }
+                    } catch { $nm = '' }
+                }
+                if ([string]::IsNullOrWhiteSpace($nm)) { $nm = [string]$d.FriendlyName }
+                if ([string]::IsNullOrWhiteSpace($nm)) { $nm = $found }
+                [void]$out.Add([pscustomobject]@{ Role = $role; InstanceId = $found; Name = $nm })
+            }
+        } catch { }
+    }
+
+    # gpu: present Display-class devices whose InstanceId starts with PCI\.  An Intel
+    # integrated GPU (PCI\VEN_8086*) is dropped when a discrete one is also present - the
+    # iGPU's interrupt is not worth a core slot, and on a desktop it usually drives nothing.
+    try {
+        if ($script:PcbIrqDisplaySource -ne $null) {
+            $disps = @($script:PcbIrqDisplaySource)
+        } else {
+            $disps = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction SilentlyContinue)
+        }
+        $gpuList = New-Object System.Collections.ArrayList
+        $hasDiscrete = $false
+        foreach ($d in $disps) {
+            if ($null -eq $d) { continue }
+            $id = [string]$d.InstanceId
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            if ($id -notlike 'PCI\*') { continue }
+            if ($id -notlike 'PCI\VEN_8086*') { $hasDiscrete = $true }
+            [void]$gpuList.Add($d)
+        }
+        foreach ($d in $gpuList) {
+            $id = [string]$d.InstanceId
+            if ($hasDiscrete -and $id -like 'PCI\VEN_8086*') {
+                Write-PcbIrqOut ('  skip integrated GPU ' + $id + ' (discrete GPU present)')
+                continue
+            }
+            [void]$out.Add([pscustomobject]@{ Role = 'gpu'; InstanceId = $id; Name = [string]$d.FriendlyName })
+        }
+    } catch { }
+
+    # nic: physical adapters that are Up on 802.3, PCI bus only. A USB Ethernet dongle
+    # (PnPDeviceID 'USB\VID_...') has no interrupt line of its own - the USB host
+    # controller owns it - so pinning its PCI path (or restarting it) is meaningless.
+    # $script:PcbIrqAdapterSource lets a unit test inject a fake adapter list
+    # (objects with .PnPDeviceID and .Name); $null means the live Get-NetAdapter.
+    try {
+        if ($script:PcbIrqAdapterSource -ne $null) {
+            $nics = @($script:PcbIrqAdapterSource)
+        } else {
+            $nics = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object {
+                $_.Status -eq 'Up' -and $_.MediaType -eq '802.3'
+            })
+        }
+        foreach ($n in $nics) {
+            $id = [string]$n.PnPDeviceID
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            if ($id -notlike 'PCI\*') { continue }
+            [void]$out.Add([pscustomobject]@{ Role = 'nic'; InstanceId = $id; Name = [string]$n.Name })
+        }
+    } catch { }
+
+    return $out
+}
+
+function Get-PcbIrqNetAdapter {
+    param([string]$InstanceId)
+    try {
+        return (Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.PnPDeviceID -eq $InstanceId } |
+            Select-Object -First 1)
+    } catch { return $null }
+}
+
+function Wait-PcbIrqDeviceOk {
+    param([string]$InstanceId, [int]$TimeoutSec)
+    $enables = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastStatus = 'unknown'
+    $lastProblem = ''
+    while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        $dev = $null
+        try { $dev = Get-PnpDevice -InstanceId $InstanceId -ErrorAction SilentlyContinue } catch { $dev = $null }
+        if ($dev -ne $null) {
+            $lastStatus = [string]$dev.Status
+            $lastProblem = [string]$dev.Problem
+            if ($lastStatus -eq 'OK') {
+                return [pscustomobject]@{ Ok = $true; Status = $lastStatus; Problem = $lastProblem; Enables = $enables }
+            }
+            $needEnable = ($lastStatus -eq 'Error') -or ($lastProblem -eq 'CM_PROB_DISABLED')
+            if ($needEnable -and $enables -lt $script:PcbIrqEnableAttempts) {
+                $enables = $enables + 1
+                Write-PcbIrqOut ('  ' + $InstanceId + ' -> Status ' + $lastStatus + ' / ' + $lastProblem + ' ; pnputil /enable-device attempt ' + $enables)
+                $eo = & pnputil.exe /enable-device "$InstanceId" 2>&1
+                Write-PcbIrqOut ('  pnputil /enable-device exit ' + $LASTEXITCODE + ' out: ' + ((@($eo) | ForEach-Object { ('' + $_).Trim() }) -join ' | '))
+            }
+        }
+        Start-Sleep -Seconds 1
+    }
+    return [pscustomobject]@{ Ok = $false; Status = $lastStatus; Problem = $lastProblem; Enables = $enables }
+}
+
+function Restart-PcbIrqByDisableEnable {
+    # Fallback for builds without 'pnputil /restart-device'. Same live effect: the driver
+    # is torn down and re-started, so a freshly written Affinity Policy is re-read.
+    # Returns just the detail suffix; Status/polling stays in Restart-PcbIrqDevice.
+    param([string]$InstanceId)
+    $detail = ''
+    try {
+        Disable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-PcbIrqOut ('  Disable-PnpDevice ' + $InstanceId + ' -> ok')
+        $detail = 'disable ok'
+    } catch {
+        Write-PcbIrqOut ('  Disable-PnpDevice ' + $InstanceId + ' -> ' + $_.Exception.Message)
+        $detail = 'disable failed: ' + $_.Exception.Message
+    }
+    Start-Sleep -Seconds 1
+    try {
+        Enable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-PcbIrqOut ('  Enable-PnpDevice ' + $InstanceId + ' -> ok')
+        $detail = $detail + ' / enable ok'
+    } catch {
+        Write-PcbIrqOut ('  Enable-PnpDevice ' + $InstanceId + ' -> ' + $_.Exception.Message)
+        $detail = $detail + ' / enable failed: ' + $_.Exception.Message
+    }
+    return $detail
+}
+
+function Get-PcbIrqRestartMethod {
+    # 'pnputil /restart-device' first shipped in Windows 10 version 2004 (build 19041).
+    # Below that build the verb does not exist and some pnputil versions still exit 0,
+    # so the exit-code fallback would never fire.  Choose the method up front instead.
+    # $script:PcbIrqOsBuild lets a unit test inject a build number.
+    $b = $script:PcbIrqOsBuild
+    if ($b -eq $null) {
+        try { $b = [int][Environment]::OSVersion.Version.Build } catch { $b = 0 }
+    }
+    if ([int]$b -lt $script:PcbIrqPnpUtilMinBuild) { return 'disable-enable' }
+    return 'pnputil'
+}
+
+function Invoke-PcbIrqRestart {
+    # Restart-PcbIrqDevice, or the injected stand-in.
+    param([string]$Role, [string]$InstanceId)
+    if ($script:PcbIrqRestartImpl -ne $null) { return (& $script:PcbIrqRestartImpl $Role $InstanceId) }
+    return (Restart-PcbIrqDevice $Role $InstanceId)
+}
+
+function Invoke-PcbIrqPoll {
+    # Wait-PcbIrqDeviceOk ($InstanceId, $TimeoutSec) -> @{ Ok; Status; Problem; Enables },
+    # or the injected stand-in. A stand-in may return a bare $true/$false.
+    param([string]$InstanceId, [int]$TimeoutSec)
+    if ($script:PcbIrqPollImpl -ne $null) { return (& $script:PcbIrqPollImpl $InstanceId $TimeoutSec) }
+    return (Wait-PcbIrqDeviceOk $InstanceId $TimeoutSec)
+}
+
+function ConvertTo-PcbIrqPoll {
+    # Normalises a poll result of either shape.
+    param($Poll)
+    if ($Poll -eq $null) { return [pscustomobject]@{ Ok = $false; Status = 'unknown'; Problem = ''; Enables = 0 } }
+    if ($Poll -is [bool]) {
+        if ($Poll) { return [pscustomobject]@{ Ok = $true; Status = 'OK'; Problem = ''; Enables = 0 } }
+        return [pscustomobject]@{ Ok = $false; Status = 'not OK'; Problem = ''; Enables = 0 }
+    }
+    $ok = $false
+    try { $ok = [bool]$Poll.Ok } catch { $ok = $false }
+    $st = ''
+    try { $st = [string]$Poll.Status } catch { $st = '' }
+    $pr = ''
+    try { $pr = [string]$Poll.Problem } catch { $pr = '' }
+    $en = 0
+    try { $en = [int]$Poll.Enables } catch { $en = 0 }
+    return [pscustomobject]@{ Ok = $ok; Status = $st; Problem = $pr; Enables = $en }
+}
+
+function Format-PcbIrqPollFail {
+    param($Poll)
+    $msg = 'final Status ' + $Poll.Status
+    if (-not [string]::IsNullOrWhiteSpace($Poll.Problem)) { $msg = $msg + ' / ' + $Poll.Problem }
+    return $msg
+}
+
+function Restart-PcbIrqDevice {
+    # Returns @{ Status; Detail }. Status is 'OK', 'OK (fallback disable/enable)' or 'FAIL: <msg>'.
+    param([string]$Role, [string]$InstanceId)
+
+    $adapter = Get-PcbIrqNetAdapter $InstanceId
+    if ($adapter -ne $null) {
+        Write-PcbIrqOut ('network drops for a few seconds on ' + $adapter.Name)
+        $name = [string]$adapter.Name
+        try {
+            Restart-NetAdapter -Name $name -Confirm:$false -ErrorAction Stop
+        } catch {
+            return [pscustomobject]@{ Status = ('FAIL: Restart-NetAdapter ' + $_.Exception.Message); Detail = $name }
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $st = 'unknown'
+        while ($sw.Elapsed.TotalSeconds -lt $script:PcbIrqPollSeconds) {
+            Start-Sleep -Seconds 1
+            $a = $null
+            try { $a = Get-NetAdapter -Name $name -ErrorAction SilentlyContinue } catch { $a = $null }
+            if ($a -ne $null) { $st = [string]$a.Status }
+            if ($st -eq 'Up') { return [pscustomobject]@{ Status = 'OK'; Detail = ($name + ' Up') } }
+        }
+        return [pscustomobject]@{ Status = ('FAIL: adapter ' + $name + ' final Status ' + $st); Detail = $name }
+    }
+
+    if ($Role -eq 'mouse-xhci' -or $Role -eq 'kbd-xhci' -or $Role -eq 'gpu') {
+        Write-PcbIrqOut 'input/screen drops for a few seconds'
+    }
+
+    $usedFallback = $false
+    $fbDetail = ''
+    $method = Get-PcbIrqRestartMethod
+    if ($script:PcbIrqForceFallback -eq $true) {
+        Write-PcbIrqOut '  fallback forced ($script:PcbIrqForceFallback = $true), pnputil /restart-device not called'
+        $usedFallback = $true
+        $fbDetail = Restart-PcbIrqByDisableEnable $InstanceId
+    } elseif ($method -eq 'disable-enable') {
+        Write-PcbIrqOut ('  OS build ' + $script:PcbIrqOsBuild + ' has no pnputil /restart-device, using disable/enable')
+        $usedFallback = $true
+        $fbDetail = Restart-PcbIrqByDisableEnable $InstanceId
+    } else {
+        $ro = & pnputil.exe /restart-device "$InstanceId" 2>&1
+        $code = $LASTEXITCODE
+        Write-PcbIrqOut ('  pnputil /restart-device ' + $InstanceId + ' exit ' + $code + ' out: ' + ((@($ro) | ForEach-Object { ('' + $_).Trim() }) -join ' | '))
+        if ($code -eq 3010) {
+            return [pscustomobject]@{ Status = 'FAIL: reboot required'; Detail = 'exit 3010' }
+        }
+        if ($code -ne 0) {
+            # older Windows 10 builds have no such verb; anything else non-zero is a
+            # restart that did not happen. Either way, try disable/enable instead.
+            Write-PcbIrqOut ('  pnputil /restart-device unusable (exit ' + $code + '), falling back to disable/enable')
+            $usedFallback = $true
+            $fbDetail = Restart-PcbIrqByDisableEnable $InstanceId
+        }
+    }
+
+    $poll = ConvertTo-PcbIrqPoll (Invoke-PcbIrqPoll $InstanceId $script:PcbIrqPollSeconds)
+    if ($poll.Ok) {
+        $detail = 'Status OK after ' + $poll.Enables + ' enable attempt(s)'
+        if ($usedFallback) { $detail = $detail + ' ; fallback: ' + $fbDetail }
+        if ($usedFallback) { return [pscustomobject]@{ Status = 'OK (fallback disable/enable)'; Detail = $detail } }
+        return [pscustomobject]@{ Status = 'OK'; Detail = $detail }
+    }
+    $msg = 'final Status ' + $poll.Status
+    if (-not [string]::IsNullOrWhiteSpace($poll.Problem)) { $msg = $msg + ' / ' + $poll.Problem }
+    return [pscustomobject]@{ Status = ('FAIL: ' + $msg); Detail = $msg }
+}
+
+function Set-PcbIrqPins {
+    param(
+        [uint64]$IrqMask,
+        $Targets = $null,
+        [switch]$NoRestart,
+        [switch]$DryRun
+    )
+
+    $rows = New-Object System.Collections.ArrayList
+    $before = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+
+    if ($Targets -eq $null) {
+        try { $Targets = @(Get-PcbIrqTargets) } catch { $Targets = @() }
+    }
+    $Targets = @($Targets)
+
+    $ncpu = 1
+    try { $ncpu = [int]$env:NUMBER_OF_PROCESSORS } catch { $ncpu = 1 }
+
+    Write-PcbIrqOut ('IrqMask 0x' + ([uint64]$IrqMask).ToString('X') + ' -> cpus [' + ((Get-PcbIrqCpuList $IrqMask) -join ',') + ']')
+
+    foreach ($t in $Targets) {
+        $role = [string]$t.Role
+        $id = [string]$t.InstanceId
+        $item = $role + ' ' + $id
+
+        $rec = $null
+        try {
+            $rec = Read-PcbIrqPin $id
+            $rec.Role = $role
+        } catch {
+            $rec = [pscustomobject]@{ Role = $role; InstanceId = $id; KeyExisted = $false; DevicePolicy = $null; Override = $null }
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item '?' '?' ('FAIL: read pin ' + $_.Exception.Message)))
+            [void]$errors.Add('read pin ' + $id + ': ' + $_.Exception.Message)
+        }
+        $rec | Add-Member -NotePropertyName Extras -NotePropertyValue @() -Force
+        $rec | Add-Member -NotePropertyName CreatedKeys -NotePropertyValue @() -Force
+        [void]$before.Add($rec)
+        $beforeText = Format-PcbIrqPin $rec.DevicePolicy $rec.Override
+
+        $cpu = $null
+        try { $cpu = Get-PcbIrqCpuForRole $IrqMask $role } catch { $cpu = $null }
+        if ($cpu -eq $null) {
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText '<none>' 'SKIP: no free core'))
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText '<none>' 'SKIP: no free core'))
+            continue
+        }
+        if ([int]$cpu -ge $ncpu) {
+            $m = 'cpu ' + $cpu + ' not present (' + $ncpu + ' logical processors)'
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText '<none>' ('FAIL: ' + $m)))
+            [void]$errors.Add($id + ': ' + $m)
+            continue
+        }
+
+        $want = Get-PcbIrqBytes ([int]$cpu)
+        $afterText = 'DP=4 OV=[' + ((@($want) | ForEach-Object { [int]$_ }) -join ',') + '] CPU' + $cpu
+
+        # The extra values this device gets. Planned up front so -DryRun can print
+        # them; the before state is read at write time, not here.
+        $plan = @()
+        try { $plan = @(Get-PcbIrqExtraPlan $role $id) } catch {
+            [void]$errors.Add($id + ': plan extras ' + $_.Exception.Message)
+        }
+
+        if ($DryRun) {
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText $afterText ('OK (dry-run) cpu ' + $cpu)))
+            foreach ($p in $plan) {
+                if ($p -eq $null) { continue }
+                $st = Read-PcbIrqExtraState ([string]$p.Path) ([string]$p.Name)
+                $bf = '<absent>'
+                if ($st.Existed) { $bf = '' + $st.Value }
+                [void]$rows.Add((New-PcbIrqRow 'value' $item $bf ('' + $p.Value) ('OK (dry-run) ' + [string]$p.Name)))
+            }
+            $rst = 'DRYRUN: restart skipped'
+            if ($NoRestart) { $rst = 'SKIP: no restart requested' }
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText $rst))
+            Write-PcbIrqOut ('  dry-run ' + $item + ' : pin ' + $beforeText + ' -> ' + $afterText + ' (no write)')
+            foreach ($p in $plan) {
+                if ($p -eq $null) { continue }
+                $st = Read-PcbIrqExtraState ([string]$p.Path) ([string]$p.Name)
+                $bf = '<absent>'
+                if ($st.Existed) { $bf = '' + $st.Value }
+                Write-PcbIrqOut ('    ' + [string]$p.Name + ': ' + $bf + ' -> ' + ('' + $p.Value))
+            }
+            continue
+        }
+
+        # 1. the pin, 2. the extra values - both before the restart, so the driver
+        # reads the whole set when the device starts again.
+        try {
+            $null = Write-PcbIrqPinValues $id 4 $want
+            $chk = Read-PcbIrqPin $id
+            $okWrite = $false
+            if ($chk.DevicePolicy -eq 4 -and $chk.Override -ne $null -and @($chk.Override).Count -eq 8) {
+                $okWrite = $true
+                for ($i = 0; $i -lt 8; $i++) { if ([int]$chk.Override[$i] -ne [int]$want[$i]) { $okWrite = $false } }
+            }
+            $readBack = Format-PcbIrqPin $chk.DevicePolicy $chk.Override
+            if ($okWrite) {
+                [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText $readBack ('OK cpu ' + $cpu)))
+            } else {
+                [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText $readBack ('FAIL: readback mismatch, want ' + $afterText)))
+                [void]$errors.Add($id + ': readback mismatch')
+            }
+        } catch {
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item $beforeText $afterText ('FAIL: write pin ' + $_.Exception.Message)))
+            [void]$errors.Add($id + ': write pin ' + $_.Exception.Message)
+        }
+
+        if ($plan.Count -gt 0) {
+            try {
+                $wr = Write-PcbIrqExtraPlan $plan
+                $rec.Extras = @($wr.Entries)
+                $rec.CreatedKeys = @($wr.CreatedKeys)
+                foreach ($e in @($wr.Entries)) {
+                    if ($e -eq $null) { continue }
+                    $bf = '<absent>'
+                    if ($e.Existed -eq $true) { $bf = '' + $e.Before }
+                    [void]$rows.Add((New-PcbIrqRow 'value' $item $bf ('' + $e.After) ('OK ' + [string]$e.Name)))
+                }
+            } catch {
+                [void]$rows.Add((New-PcbIrqRow 'value' $item '?' '?' ('FAIL: write extras ' + $_.Exception.Message)))
+                [void]$errors.Add($id + ': write extras ' + $_.Exception.Message)
+            }
+        }
+
+        if ($NoRestart) {
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText 'SKIP: no restart requested'))
+            continue
+        }
+        try {
+            $r = Invoke-PcbIrqRestart $role $id
+            $status = [string]$r.Status
+            if ($status -like 'FAIL*') {
+                # 3. auto-rollback: put the pin and the extras back and restart once more.
+                $reason = $status -replace '^FAIL:\s*', ''
+                try {
+                    $null = Write-PcbIrqPinValues $id $rec.DevicePolicy $rec.Override
+                    $null = Restore-PcbIrqExtras $rec.Extras $rec.CreatedKeys
+                } catch {
+                    [void]$errors.Add($id + ': rollback write ' + $_.Exception.Message)
+                }
+                $r2 = $null
+                try { $r2 = Invoke-PcbIrqRestart $role $id } catch {
+                    [void]$errors.Add($id + ': rollback restart ' + $_.Exception.Message)
+                }
+                $s2 = ''
+                if ($r2 -ne $null) { $s2 = [string]$r2.Status }
+                $msi2 = ''
+                try { $msi2 = (Get-PcbIrqInterruptType $id).Text } catch { $msi2 = 'msi=?' }
+                Write-PcbIrqOut ('  ' + $id + ' -> ' + $msi2)
+                if ($s2 -like 'FAIL*') {
+                    $st2 = 'FAIL: rollback restart failed (' + $reason + ')'
+                    [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText $st2 $msi2))
+                    [void]$errors.Add($id + ': ' + $st2 + ' ; second ' + $s2)
+                } else {
+                    $st1 = 'FAIL: rolled back (' + $reason + ')'
+                    [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText $st1 $msi2))
+                    [void]$errors.Add($id + ': ' + $st1)
+                }
+            } else {
+                $msiText = ''
+                try { $msiText = (Get-PcbIrqInterruptType $id).Text } catch { $msiText = 'msi=?' }
+                [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText $status $msiText))
+                Write-PcbIrqOut ('  ' + $id + ' -> ' + $msiText)
+            }
+        } catch {
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $beforeText $afterText ('FAIL: restart ' + $_.Exception.Message)))
+            [void]$errors.Add($id + ': restart ' + $_.Exception.Message)
+        }
+    }
+
+    $ok = $true
+    foreach ($r in $rows) { if ($r.Status -like 'FAIL*') { $ok = $false } }
+    return [pscustomobject]@{
+        Ok     = $ok
+        Before = @($before.ToArray())
+        Rows   = @($rows.ToArray())
+        Error  = ($errors -join ' | ')
+    }
+}
+
+function Restore-PcbIrqPins {
+    param(
+        $Before = $null,
+        [switch]$NoRestart
+    )
+
+    $rows = New-Object System.Collections.ArrayList
+    $errors = New-Object System.Collections.ArrayList
+
+    $records = @()
+    if ($Before -ne $null) { $records = @($Before) }
+
+    foreach ($rec in $records) {
+        if ($rec -eq $null) { continue }
+        $role = [string]$rec.Role
+        $id = [string]$rec.InstanceId
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $item = $role + ' ' + $id
+        $wantDP = $rec.DevicePolicy
+        $wantOV = $rec.Override
+        $cur = $null
+        try { $cur = Read-PcbIrqPin $id } catch { $cur = $null }
+        $curText = 'unknown'
+        if ($cur -ne $null) { $curText = Format-PcbIrqPin $cur.DevicePolicy $cur.Override }
+        $targetText = Format-PcbIrqPin $wantDP $wantOV
+
+        try {
+            if ($rec.KeyExisted -eq $false) {
+                # key did not exist before: leave the key, drop both values
+                $null = Write-PcbIrqPinValues $id $null $null
+                $chk = Read-PcbIrqPin $id
+                $rb = Format-PcbIrqPin $chk.DevicePolicy $chk.Override
+                if ($chk.DevicePolicy -eq $null -and $chk.Override -eq $null) {
+                    [void]$rows.Add((New-PcbIrqRow 'irq' $item $curText $rb 'OK'))
+                } else {
+                    [void]$rows.Add((New-PcbIrqRow 'irq' $item $curText $rb 'FAIL: values still present'))
+                    [void]$errors.Add($id + ': restore left values')
+                }
+            } else {
+                $null = Write-PcbIrqPinValues $id $wantDP $wantOV
+                $chk = Read-PcbIrqPin $id
+                $rb = Format-PcbIrqPin $chk.DevicePolicy $chk.Override
+                $okW = $false
+                if ($wantDP -eq $null) {
+                    $okW = ($chk.DevicePolicy -eq $null)
+                } else {
+                    $okW = ($chk.DevicePolicy -ne $null -and [int]$chk.DevicePolicy -eq [int]$wantDP)
+                }
+                if ($okW -and $wantOV -ne $null) {
+                    if ($chk.Override -eq $null -or @($chk.Override).Count -ne @($wantOV).Count) {
+                        $okW = $false
+                    } else {
+                        $n = @($wantOV).Count
+                        for ($i = 0; $i -lt $n; $i++) {
+                            if ([int]$chk.Override[$i] -ne [int](@($wantOV)[$i])) { $okW = $false }
+                        }
+                    }
+                }
+                if ($okW -and $wantOV -eq $null -and $chk.Override -ne $null) { $okW = $false }
+                if ($okW) {
+                    [void]$rows.Add((New-PcbIrqRow 'irq' $item $curText $rb 'OK'))
+                } else {
+                    [void]$rows.Add((New-PcbIrqRow 'irq' $item $curText $rb ('FAIL: readback mismatch, want ' + $targetText)))
+                    [void]$errors.Add($id + ': restore readback mismatch')
+                }
+            }
+        } catch {
+            [void]$rows.Add((New-PcbIrqRow 'irq' $item $curText $targetText ('FAIL: restore pin ' + $_.Exception.Message)))
+            [void]$errors.Add($id + ': restore pin ' + $_.Exception.Message)
+        }
+
+        # The extra values come back before the restart, so the driver re-reads the
+        # pre-kit state when the device starts again.
+        $extras = @()
+        try {
+            $p = $rec.PSObject.Properties['Extras']
+            if ($p -ne $null -and $p.Value -ne $null) { $extras = @($p.Value) }
+        } catch { $extras = @() }
+        $createdKeys = @()
+        try {
+            $p = $rec.PSObject.Properties['CreatedKeys']
+            if ($p -ne $null -and $p.Value -ne $null) { $createdKeys = @($p.Value) }
+        } catch { $createdKeys = @() }
+        if ($extras.Count -gt 0 -or $createdKeys.Count -gt 0) {
+            try {
+                $bad = @(Restore-PcbIrqExtras $extras $createdKeys)
+                if ($bad.Count -eq 0) {
+                    [void]$rows.Add((New-PcbIrqRow 'value' $item ('' + $extras.Count) '0' 'OK restored'))
+                } else {
+                    [void]$rows.Add((New-PcbIrqRow 'value' $item '?' '?' ('FAIL: ' + ($bad -join ' | '))))
+                    [void]$errors.Add($id + ': restore extras ' + ($bad -join ' | '))
+                }
+            } catch {
+                [void]$rows.Add((New-PcbIrqRow 'value' $item '?' '?' ('FAIL: restore extras ' + $_.Exception.Message)))
+                [void]$errors.Add($id + ': restore extras ' + $_.Exception.Message)
+            }
+        }
+
+        # The pin branch may have created the Affinity Policy key before the extras were
+        # planned, so it was never recorded as created. The device's key chain did not
+        # exist before the kit, so take the now-empty leftovers away too.
+        if ($rec.KeyExisted -eq $false) {
+            try { Remove-PcbIrqEmptyKeyChain (Get-PcbIrqApKey $id) } catch { }
+        }
+
+        if ($NoRestart) {
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $curText $targetText 'SKIP: no restart requested'))
+            continue
+        }
+        try {
+            $r = Invoke-PcbIrqRestart $role $id
+            $msiR = ''
+            try { $msiR = (Get-PcbIrqInterruptType $id).Text } catch { $msiR = 'msi=?' }
+            Write-PcbIrqOut ('  ' + $id + ' -> ' + $msiR)
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $curText $targetText $r.Status $msiR))
+            if ($r.Status -like 'FAIL*') { [void]$errors.Add($id + ': ' + $r.Status) }
+        } catch {
+            [void]$rows.Add((New-PcbIrqRow 'restart' $item $curText $targetText ('FAIL: restart ' + $_.Exception.Message)))
+            [void]$errors.Add($id + ': restart ' + $_.Exception.Message)
+        }
+    }
+
+    $ok = $true
+    foreach ($r in $rows) { if ($r.Status -like 'FAIL*') { $ok = $false } }
+    return [pscustomobject]@{
+        Ok     = $ok
+        Before = @()
+        Rows   = @($rows.ToArray())
+        Error  = ($errors -join ' | ')
+    }
+}
+
+# ==== end irq.ps1 ====
+
+# ==== begin timer.ps1 ====
+# W-PCB7A - high resolution timer hold for the PC-bang kit.
+# Pure Windows PowerShell 5.1, single file, ASCII only, no exe, no network.
+#
+# Public API:
+#   Start-PcbTimerHold [-Resolution <100ns units>]  -> Ok / Min / Max / Current / ThrottleOptOut / Error
+#   Get-PcbTimerResolution                          -> Min / Max / Current   (ntdll, no side effect)
+#   Format-PcbTimerMs <units>                       -> '0.507 ms'
+#
+# Why: Windows only honours a requested timer resolution on the thread that asked for
+# it, and a background process on Windows 11 normally gets its request clamped by power
+# throttling.  Opting out of PROCESS_POWER_THROTTLING (EXECUTION_SPEED +
+# IGNORE_TIMER_RESOLUTION) and then asking ntdll for 5000 units gives the whole session
+# a 0.5 ms system timer while this process stays alive.  Measured on this PC: with the
+# holder running NtQueryTimerResolution reports 5000, and it drops back to 5070 within
+# one second of the holder exiting, so the hold needs a process that lives for the
+# session - the watcher (step h) is exactly that process.
+#
+# Nothing here throws: every failure comes back with Ok=$false and an Error string.
+
+$script:PcbTimerCs = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class PcbTimer
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_POWER_THROTTLING_STATE
+    {
+        public uint Version;
+        public uint ControlMask;
+        public uint StateMask;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetProcessInformation(IntPtr hProcess, int infoClass,
+        ref PROCESS_POWER_THROTTLING_STATE info, int size);
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetTimerResolution(uint desired, bool set, out uint current);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryTimerResolution(out uint min, out uint max, out uint current);
+
+    // ControlMask 0x5 = EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION, StateMask 0 clears
+    // both, i.e. this process opts out of the throttle it would otherwise get.
+    public static bool OptOutOfThrottling()
+    {
+        PROCESS_POWER_THROTTLING_STATE st = new PROCESS_POWER_THROTTLING_STATE();
+        st.Version = 1;
+        st.ControlMask = 0x5;
+        st.StateMask = 0;
+        return SetProcessInformation(GetCurrentProcess(), 4, ref st,
+            Marshal.SizeOf(typeof(PROCESS_POWER_THROTTLING_STATE)));
+    }
+}
+'@
+
+function Initialize-PcbTimerNative {
+  if (-not ('PcbTimer' -as [type])) {
+    Add-Type -TypeDefinition $script:PcbTimerCs -ErrorAction Stop
+  }
+  return $true
+}
+
+function Get-PcbTimerResolution {
+  $rec = @{ Ok = $false; Min = 0; Max = 0; Current = 0; Error = '' }
+  try {
+    if (-not (Initialize-PcbTimerNative)) { return $rec }
+    $mn = [uint32]0
+    $mx = [uint32]0
+    $cu = [uint32]0
+    $st = [PcbTimer]::NtQueryTimerResolution([ref]$mn, [ref]$mx, [ref]$cu)
+    $rec.Ok = ($st -eq 0)
+    $rec.Min = [int]$mn
+    $rec.Max = [int]$mx
+    $rec.Current = [int]$cu
+    if ($st -ne 0) { $rec.Error = 'NtQueryTimerResolution status 0x' + ('{0:X8}' -f $st) }
+  } catch {
+    $rec.Error = $_.Exception.Message
+  }
+  return [pscustomobject]$rec
+}
+
+function Format-PcbTimerMs([int]$Units) {
+  if ($Units -le 0) { return 'n/a' }
+  # 100 ns units -> milliseconds, three decimals is enough for 0.507
+  $ms = [double]$Units / 10000.0
+  return ('{0:0.000} ms' -f $ms)
+}
+
+function Start-PcbTimerHold {
+  param([int]$Resolution = 5070)
+  $rec = [pscustomobject]@{ Ok = $false; Min = 0; Max = 0; Current = 0; ThrottleOptOut = $false; Error = '' }
+  try {
+    if (-not (Initialize-PcbTimerNative)) { $rec.Error = 'Add-Type failed'; return $rec }
+    try { $rec.ThrottleOptOut = [bool][PcbTimer]::OptOutOfThrottling() } catch { $rec.ThrottleOptOut = $false }
+    $cur = [uint32]0
+    $st = [PcbTimer]::NtSetTimerResolution([uint32]$Resolution, $true, [ref]$cur)
+    $rec.Current = [int]$cur
+    if ($st -ne 0) {
+      $rec.Error = 'NtSetTimerResolution status 0x' + ('{0:X8}' -f $st)
+    } else {
+      $rec.Ok = $true
+    }
+    $q = Get-PcbTimerResolution
+    if ($q.Ok) {
+      $rec.Min = [int]$q.Min
+      $rec.Max = [int]$q.Max
+      $rec.Current = [int]$q.Current
+    }
+  } catch {
+    $rec.Ok = $false
+    $rec.Error = $_.Exception.Message
+  }
+  return $rec
+}
+
+# ==== end timer.ps1 ====
+
+# ==== begin gpuclock.ps1 ====
+# W-PCB7A - GPU clock / power lock for the PC-bang kit (nvidia-smi wrapper).
+# Pure Windows PowerShell 5.1, single file, ASCII only, no network.
+#
+# Public API:
+#   Get-PcbGpuClockState              -> Available / Exe / Before{...} / Error
+#   Set-PcbGpuClock [-State <s>]      -> Ok / Rows[{Item,Before,After,Status}] / Applied / Error
+#   Restore-PcbGpuClock -Rec <r>      -> Ok / Rows[{...}] / Error
+#
+# The home script wrote fixed constants (-pl 140, -lgc 2012,2012, -lmc 4004,4004,
+# -ac 2012,4004, -pm 1).  This module reads the card's own maxima and mirrors the same
+# commands with them, so the kit is right on any card instead of only this 1060.
+#
+# Measured on this PC (GTX 1060, driver 32.0.15.8253):
+#   power.max_limit 140 W, clocks.max.graphics 2012 MHz, clocks.max.memory 4004 MHz
+#   -pl      -> honoured ("was set to 140.00 W"), read back from power.limit
+#   -lgc/-lmc/-ac -> "Setting locked ... is not supported for GPU", rc 0 -> SKIP row
+#   -pm 1    -> "not supported ... on this platform" (Linux only) -> SKIP row
+#
+# The runner is injectable: $script:PcbNvSmiRunner receives an argument array and must
+# return @{ Output = '<text>'; Code = <int> }.  Tests replace it so nothing is executed.
+#
+# Nothing here throws: every failure comes back with Ok=$false and an Error string.
+
+$script:PcbNvSmiRunner = $null
+
+function Get-PcbNvSmiExe {
+  $cands = New-Object System.Collections.ArrayList
+  [void]$cands.Add((Join-Path $env:SystemRoot 'System32\nvidia-smi.exe'))
+  if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
+    [void]$cands.Add((Join-Path $env:ProgramFiles 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))
+  }
+  if (-not [string]::IsNullOrWhiteSpace(${env:ProgramW6432})) {
+    [void]$cands.Add((Join-Path ${env:ProgramW6432} 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))
+  }
+  foreach ($c in $cands) {
+    if (Test-Path -LiteralPath $c) { return $c }
+  }
+  return $null
+}
+
+function Invoke-PcbNvSmi {
+  param([string[]]$Arguments)
+  if ($null -ne $script:PcbNvSmiRunner) {
+    $r = & $script:PcbNvSmiRunner $Arguments
+    $out = ''
+    $code = 0
+    if ($null -ne $r) {
+      if ($r -is [hashtable] -or $r.PSObject.Properties['Output']) {
+        $out = [string]$r.Output
+        if ($null -ne $r.Code) { $code = [int]$r.Code }
+      } else {
+        $out = [string]$r
+      }
+    }
+    return [pscustomobject]@{ Output = $out; Code = $code }
+  }
+  $exe = Get-PcbNvSmiExe
+  if ($null -eq $exe) { return [pscustomobject]@{ Output = ''; Code = -1 } }
+  $txt = ''
+  try {
+    $txt = (@(& $exe @Arguments 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+    $rc = $LASTEXITCODE
+  } catch {
+    return [pscustomobject]@{ Output = $_.Exception.Message; Code = -1 }
+  }
+  return [pscustomobject]@{ Output = $txt; Code = [int]$rc }
+}
+
+# '120.00 W, 120.00 W, 140.00 W, 2012 MHz, 4004 MHz' -> same shape as a list of numbers
+function ConvertFrom-PcbNvNum([string]$Text) {
+  $m = [regex]::Match([string]$Text, '([0-9]+(?:\.[0-9]+)?)')
+  if ($m.Success) {
+    $v = 0.0
+    if ([double]::TryParse($m.Groups[1].Value, [ref]$v)) { return $v }
+  }
+  return $null
+}
+
+function Get-PcbGpuClockState {
+  $rec = [pscustomobject]@{
+    Available = $false
+    Exe       = ''
+    Before    = $null
+    Error     = ''
+  }
+  try {
+    $exe = Get-PcbNvSmiExe
+    if ($null -ne $script:PcbNvSmiRunner -or $null -ne $exe) { $rec.Available = $true }
+    $rec.Exe = [string]$exe
+    if (-not $rec.Available) {
+      $rec.Error = 'nvidia-smi.exe not found'
+      return $rec
+    }
+    $q = Invoke-PcbNvSmi @('--query-gpu=power.limit,power.default_limit,power.max_limit,clocks.max.graphics,clocks.max.memory', '--format=csv,noheader')
+    $line = ''
+    foreach ($l in ([string]$q.Output).Split("`n")) {
+      $t = $l.Trim()
+      if ($t.Length -gt 0) { $line = $t; break }
+    }
+    if ($line.Length -eq 0) {
+      $rec.Available = $false
+      $rec.Error = 'nvidia-smi returned no data (rc ' + $q.Code + ')'
+      return $rec
+    }
+    $parts = @($line.Split(','))
+    if ($parts.Count -lt 5) {
+      $rec.Available = $false
+      $rec.Error = 'unexpected nvidia-smi row: ' + $line
+      return $rec
+    }
+    $rec.Before = [pscustomobject]@{
+      PowerLimit    = ConvertFrom-PcbNvNum $parts[0]
+      DefaultLimit  = ConvertFrom-PcbNvNum $parts[1]
+      MaxLimit      = ConvertFrom-PcbNvNum $parts[2]
+      MaxGraphics   = ConvertFrom-PcbNvNum $parts[3]
+      MaxMemory     = ConvertFrom-PcbNvNum $parts[4]
+    }
+    if ($null -eq $rec.Before.MaxLimit -or $null -eq $rec.Before.MaxGraphics -or $null -eq $rec.Before.MaxMemory) {
+      $rec.Available = $false
+      $rec.Error = 'could not parse nvidia-smi row: ' + $line
+      return $rec
+    }
+  } catch {
+    $rec.Available = $false
+    $rec.Error = $_.Exception.Message
+  }
+  return $rec
+}
+
+function Format-PcbNvNum($Value, [string]$Suffix) {
+  if ($null -eq $Value) { return 'n/a' }
+  return ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.##}', [double]$Value) + $Suffix)
+}
+
+# The stored record reaches Restore-PcbGpuClock in two shapes: the hashtable main.ps1
+# builds in memory, and the PSCustomObject that ConvertFrom-Json returns after the state
+# file is reloaded on a revert run.  $Rec.PSObject.Properties[...] is empty for a
+# hashtable, so reading the record any other way silently skips every revert.
+function Get-PcbRecValue($Rec, [string]$Name) {
+  if ($null -eq $Rec) { return $null }
+  if ($Rec -is [System.Collections.IDictionary]) {
+    if ($Rec.Contains($Name)) { return $Rec[$Name] }
+    return $null
+  }
+  $p = $Rec.PSObject.Properties[$Name]
+  if ($null -ne $p) { return $p.Value }
+  return $null
+}
+
+# A non-zero exit or a 'not supported' / 'warning' banner means the card refused the
+# command; that is a SKIP row, never an OK one.
+function Test-PcbNvRejected($Result) {
+  $t = [string]$Result.Output
+  if ([int]$Result.Code -ne 0) { return $true }
+  if ($t -match '(?i)not supported') { return $true }
+  if ($t -match '(?i)does not support') { return $true }
+  if ($t -match '(?i)^\s*NVIDIA\s+SMI\s+has\s+failed') { return $true }
+  if ($t -match '(?i)insufficient permissions') { return $true }
+  return $false
+}
+
+function Get-PcbNvMsg([string]$Text) {
+  foreach ($l in ([string]$Text).Split("`n")) {
+    $t = $l.Trim()
+    if ($t.Length -eq 0) { continue }
+    if ($t -match '(?i)^All done\.?$') { continue }
+    return $t
+  }
+  return 'no output'
+}
+
+function Read-PcbGpuLiveRow {
+  $q = Invoke-PcbNvSmi @('--query-gpu=power.limit,clocks.gr,clocks.mem', '--format=csv,noheader')
+  foreach ($l in ([string]$q.Output).Split("`n")) {
+    $t = $l.Trim()
+    if ($t.Length -gt 0) { return $t }
+  }
+  return ''
+}
+
+function Set-PcbGpuClock {
+  param($State)
+  $rows = New-Object System.Collections.ArrayList
+  $rec = [pscustomobject]@{ Ok = $false; Rows = @(); Applied = $null; Error = '' }
+  $applied = [pscustomobject]@{ PowerLimit = $null; LockedGfx = $false; LockedMem = $false; AppClocks = $false }
+  try {
+    if ($null -eq $State) { $State = Get-PcbGpuClockState }
+    if ($null -eq $State -or -not $State.Available) {
+      $msg = 'nvidia-smi unavailable'
+      if ($null -ne $State -and -not [string]::IsNullOrWhiteSpace([string]$State.Error)) { $msg = [string]$State.Error }
+      [void]$rows.Add([pscustomobject]@{ Item = 'gpu/clock'; Before = 'n/a'; After = 'n/a'; Status = ('SKIP: ' + $msg) })
+      $rec.Rows = @($rows)
+      $rec.Error = $msg
+      return $rec
+    }
+    $b = $State.Before
+    $plWant = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.##}', [double]$b.MaxLimit)
+    $grWant = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0}', [double]$b.MaxGraphics)
+    $memWant = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0}', [double]$b.MaxMemory)
+    $beforePl = Format-PcbNvNum $b.PowerLimit ' W'
+
+    # -pl: the one command this card honours.  Verified by reading power.limit back.
+    $r = Invoke-PcbNvSmi @('-pl', $plWant)
+    if (Test-PcbNvRejected $r) {
+      [void]$rows.Add([pscustomobject]@{ Item = 'gpu/power-limit'; Before = $beforePl; After = $beforePl; Status = ('SKIP: ' + (Get-PcbNvMsg $r.Output)) })
+    } else {
+      $live = Read-PcbGpuLiveRow
+      $livePl = ConvertFrom-PcbNvNum ((@($live.Split(','))[0]))
+      $applied.PowerLimit = $b.PowerLimit
+      $afterPl = Format-PcbNvNum $livePl ' W'
+      $st = 'OK'
+      if ($null -eq $livePl -or [double]$livePl -ne [double]$b.MaxLimit) { $st = 'OK (written)' }
+      [void]$rows.Add([pscustomobject]@{ Item = 'gpu/power-limit'; Before = $beforePl; After = $afterPl; Status = $st })
+    }
+
+    # -lgc / -lmc / -ac: refused outright on a GeForce card, so the row carries the
+    # driver's own words.  Revert only runs for the ones that were accepted.
+    $lockSpecs = @(
+      @{ Item = 'gpu/lock-gfx'; Args = @('-lgc', ($grWant + ',' + $grWant)); Flag = 'LockedGfx'; Want = $grWant },
+      @{ Item = 'gpu/lock-mem'; Args = @('-lmc', ($memWant + ',' + $memWant)); Flag = 'LockedMem'; Want = $memWant },
+      @{ Item = 'gpu/app-clock'; Args = @('-ac', ($memWant + ',' + $grWant)); Flag = 'AppClocks'; Want = ($grWant + '/' + $memWant) }
+    )
+    foreach ($spec in $lockSpecs) {
+      $r = Invoke-PcbNvSmi $spec.Args
+      if (Test-PcbNvRejected $r) {
+        [void]$rows.Add([pscustomobject]@{ Item = $spec.Item; Before = 'unset'; After = 'unset'; Status = ('SKIP: ' + (Get-PcbNvMsg $r.Output)) })
+        continue
+      }
+      $applied.($spec.Flag) = $true
+      $live = Read-PcbGpuLiveRow
+      $st = 'OK (written)'
+      if ($spec.Item -eq 'gpu/lock-gfx' -and $live.Length -gt 0) {
+        $curGr = ConvertFrom-PcbNvNum ((@($live.Split(','))[1]))
+        if ($null -ne $curGr) { $st = 'OK (read-back ' + (Format-PcbNvNum $curGr ' MHz') + ')' }
+      }
+      [void]$rows.Add([pscustomobject]@{ Item = $spec.Item; Before = 'unset'; After = [string]$spec.Want; Status = $st })
+    }
+
+    # -pm is Linux-only; this card answers "not supported ... on this platform".
+    $r = Invoke-PcbNvSmi @('-pm', '1')
+    if (Test-PcbNvRejected $r) {
+      [void]$rows.Add([pscustomobject]@{ Item = 'gpu/persistence-mode'; Before = 'n/a'; After = 'n/a'; Status = ('SKIP: ' + (Get-PcbNvMsg $r.Output)) })
+    } else {
+      [void]$rows.Add([pscustomobject]@{ Item = 'gpu/persistence-mode'; Before = 'n/a'; After = '1'; Status = 'OK (written)' })
+    }
+
+    $rec.Ok = $true
+    $rec.Applied = $applied
+    $rec.Rows = @($rows)
+  } catch {
+    $rec.Ok = $false
+    $rec.Error = $_.Exception.Message
+    [void]$rows.Add([pscustomobject]@{ Item = 'gpu/clock'; Before = 'unknown'; After = 'unknown'; Status = ('FAIL: ' + $_.Exception.Message) })
+    $rec.Rows = @($rows)
+  }
+  return $rec
+}
+
+function Restore-PcbGpuClock {
+  param($Rec)
+  $rows = New-Object System.Collections.ArrayList
+  $out = [pscustomobject]@{ Ok = $false; Rows = @(); Error = '' }
+  try {
+    if ($null -eq $Rec) { $out.Error = 'nothing recorded'; $out.Rows = @(); return $out }
+    $recPl = Get-PcbRecValue $Rec 'PowerLimit'
+    if ($null -ne $recPl) {
+      $want = [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:0.##}', [double]$recPl)
+      $r = Invoke-PcbNvSmi @('-pl', $want)
+      $live = Read-PcbGpuLiveRow
+      $livePl = $null
+      if ($live.Length -gt 0) { $livePl = ConvertFrom-PcbNvNum ((@($live.Split(','))[0])) }
+      if (Test-PcbNvRejected $r) {
+        [void]$rows.Add([pscustomobject]@{ Item = 'gpu/power-limit'; Before = '(tuned)'; After = (Format-PcbNvNum $livePl ' W'); Status = ('SKIP: ' + (Get-PcbNvMsg $r.Output)) })
+      } elseif ($null -ne $livePl -and [double]$livePl -eq [double]$recPl) {
+        [void]$rows.Add([pscustomobject]@{ Item = 'gpu/power-limit'; Before = '(tuned)'; After = (Format-PcbNvNum $livePl ' W'); Status = 'OK' })
+      } else {
+        [void]$rows.Add([pscustomobject]@{ Item = 'gpu/power-limit'; Before = '(tuned)'; After = (Format-PcbNvNum $livePl ' W'); Status = 'FAIL: read-back differs' })
+      }
+    }
+    foreach ($spec in @(
+      @{ Item = 'gpu/lock-gfx'; Flag = 'LockedGfx'; Arg = '-rgc' },
+      @{ Item = 'gpu/lock-mem'; Flag = 'LockedMem'; Arg = '-rmc' },
+      @{ Item = 'gpu/app-clock'; Flag = 'AppClocks'; Arg = '-rac' }
+    )) {
+      if (-not [bool](Get-PcbRecValue $Rec $spec.Flag)) { continue }
+      $r = Invoke-PcbNvSmi @($spec.Arg)
+      if (Test-PcbNvRejected $r) {
+        [void]$rows.Add([pscustomobject]@{ Item = $spec.Item; Before = '(tuned)'; After = '(tuned)'; Status = ('SKIP: ' + (Get-PcbNvMsg $r.Output)) })
+      } else {
+        [void]$rows.Add([pscustomobject]@{ Item = $spec.Item; Before = '(tuned)'; After = 'unset'; Status = 'OK (written)' })
+      }
+    }
+    $out.Ok = $true
+    $out.Rows = @($rows)
+  } catch {
+    $out.Ok = $false
+    $out.Error = $_.Exception.Message
+  }
+  return $out
+}
+
+# ==== end gpuclock.ps1 ====
+
+# ==== begin lolcfg.ps1 ====
+# W-PCB7A - League of Legends game.cfg / PersistedSettings.json tuning.
+# Pure Windows PowerShell 5.1, single file, ASCII only, no network.
+#
+# Public API:
+#   Get-PcbLolCfgDir                                    -> path or $null
+#   Get-PcbLolCfgState [-Dir <d>]                       -> Available / Dir / Rows / Error
+#   Set-PcbLolCfg    [-State <s>] [-BackupDir <d>]      -> Ok / Rows / Backup / Applied / Error
+#   Restore-PcbLolCfg -Rec <r>                          -> Ok / Rows / Error
+#   $script:PcbLolCfgDir    - override the Config dir (tests point this at a temp copy)
+#   $script:PcbLolCfgValues - the row table (Value = live home value)
+#
+# Only four groups are written (REPORT-W-INV1 rows 54, 55, 56, 58); mouse speed and the
+# colour block (rows 57 and 59) are personal settings and stay out.
+#
+# game.cfg is an INI-ish key=value file; PersistedSettings.json repeats the same names
+# under files[].sections[].settings[] with every value as a STRING.  Both are edited in
+# place, byte for byte.  The original bytes are copied into the state dir before
+# anything is written and a revert copies them back, so the restore is exact.
+#
+# Nothing here throws: every failure comes back with Ok=$false and an Error string.
+
+$script:PcbLolCfgDir = $null
+
+# Values come from the LIVE home file (C:\Riot Games\League of Legends\Config\game.cfg),
+# not from cfg.ps1 - two of cfg.ps1's values did not stick at home.
+$script:PcbLolCfgValues = @(
+  @{ Section = 'General';     Name = 'WindowMode';          Value = '0' },
+  @{ Section = 'General';     Name = 'WaitForVerticalSync'; Value = '0' },
+  @{ Section = 'General';     Name = 'PredictMovement';     Value = '0' },
+  @{ Section = 'Performance'; Name = 'FrameCapType';        Value = '10' }
+)
+
+$script:PcbLolCfgFiles = @('game.cfg', 'PersistedSettings.json')
+
+function Get-PcbLolCfgDir {
+  if (-not [string]::IsNullOrWhiteSpace([string]$script:PcbLolCfgDir)) { return [string]$script:PcbLolCfgDir }
+  if (-not (Get-Command Get-PcbLolExe -ErrorAction SilentlyContinue)) { return $null }
+  $exe = $null
+  try { $exe = Get-PcbLolExe } catch { $exe = $null }
+  if ([string]::IsNullOrWhiteSpace([string]$exe)) { return $null }
+  # <install>\Game\League of Legends.exe -> <install>\Config
+  $gameDir = Split-Path -Parent ([string]$exe)
+  $root = Split-Path -Parent $gameDir
+  if ([string]::IsNullOrWhiteSpace($root)) { return $null }
+  return (Join-Path $root 'Config')
+}
+
+function Test-PcbLolRunning {
+  foreach ($n in @('League of Legends', 'LeagueClient', 'LeagueClientUx')) {
+    if (@(Get-Process -Name $n -ErrorAction SilentlyContinue).Count -gt 0) { return $true }
+  }
+  return $false
+}
+
+# Reads Name=Value out of an INI-ish file plus the line separator it uses, so a writer
+# can put the file back together byte-identically.
+function Read-PcbLolCfgIni([string]$Path) {
+  $rec = [pscustomobject]@{ Existed = $false; Text = ''; Sep = "`r`n"; Values = @{}; Error = '' }
+  if (-not (Test-Path -LiteralPath $Path)) { return $rec }
+  try {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $rec.Existed = $true
+    $rec.Text = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $crlf = ([regex]::Matches($rec.Text, "`r`n")).Count
+    $lf = ([regex]::Matches($rec.Text, "(?<!`r)`n")).Count
+    if ($lf -gt $crlf) { $rec.Sep = "`n" }
+    $sec = ''
+    foreach ($ln in [regex]::Split($rec.Text, '\r\n|\n|\r')) {
+      $t = $ln.Trim()
+      if ($t.Length -eq 0) { continue }
+      if ($t.StartsWith('[')) {
+        $m = [regex]::Match($t, '^\[([^\]]+)\]')
+        if ($m.Success) { $sec = $m.Groups[1].Value }
+        continue
+      }
+      $eq = $t.IndexOf('=')
+      if ($eq -le 0) { continue }
+      $k = $t.Substring(0, $eq).Trim()
+      $v = $t.Substring($eq + 1).Trim()
+      $rec.Values[$sec + '/' + $k] = $v
+    }
+  } catch {
+    $rec.Error = $_.Exception.Message
+  }
+  return $rec
+}
+
+function Get-PcbLolCfgState {
+  param([string]$Dir = '')
+  $rec = [pscustomobject]@{ Available = $false; Dir = ''; Sep = "`r`n"; Rows = @(); Error = '' }
+  try {
+    $d = $Dir
+    if ([string]::IsNullOrWhiteSpace($d)) { $d = Get-PcbLolCfgDir }
+    $rec.Dir = [string]$d
+    if ([string]::IsNullOrWhiteSpace($d) -or -not (Test-Path -LiteralPath $d)) {
+      $rec.Error = 'Config dir not found'
+      return $rec
+    }
+    $cfg = Read-PcbLolCfgIni (Join-Path $d 'game.cfg')
+    if (-not $cfg.Existed) {
+      $rec.Error = 'game.cfg not found'
+      return $rec
+    }
+    $rec.Sep = [string]$cfg.Sep
+    $rec.Available = $true
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($v in $script:PcbLolCfgValues) {
+      $key = $v.Section + '/' + $v.Name
+      $cur = '(absent)'
+      if ($cfg.Values.ContainsKey($key)) { $cur = [string]$cfg.Values[$key] }
+      [void]$rows.Add([pscustomobject]@{ Section = $v.Section; Name = $v.Name; Before = $cur; Want = [string]$v.Value })
+    }
+    $rec.Rows = @($rows)
+  } catch {
+    $rec.Available = $false
+    $rec.Error = $_.Exception.Message
+  }
+  return $rec
+}
+
+# Replaces the value bytes of 'Name=old' inside a section and nothing else.
+#
+# The split pattern captures the line breaks, so the pieces alternate between
+# line-content and terminator: even indices are content, odd indices are the exact
+# terminator that line had.  Only an even index is ever written, and the join puts the
+# terminators back untouched, so a file with 201 CRLF and 6 lone LF still has 201 CRLF
+# and 6 lone LF afterwards, on the same lines, and a file with no trailing newline keeps
+# having none.  (The previous version split with a non-capturing pattern and re-joined
+# with one separator, which turned every apply into an all-CRLF rewrite of the file.)
+#
+# $Sep is kept for call compatibility; it is no longer used.
+function Set-PcbLolCfgIniValue([string]$Text, [string]$Section, [string]$Name, [string]$Value, [string]$Sep) {
+  $parts = [regex]::Split($Text, '(\r\n|\n|\r)')
+  $sec = ''
+  for ($i = 0; $i -lt $parts.Count; $i += 2) {
+    $raw = [string]$parts[$i]
+    $t = $raw.Trim()
+    if ($t.StartsWith('[')) {
+      $m = [regex]::Match($t, '^\[([^\]]+)\]')
+      if ($m.Success) { $sec = $m.Groups[1].Value }
+      continue
+    }
+    if ($sec -ne $Section) { continue }
+    $eq = $t.IndexOf('=')
+    if ($eq -le 0) { continue }
+    if ($t.Substring(0, $eq).Trim() -ne $Name) { continue }
+    $rawEq = $raw.IndexOf('=')
+    if ($rawEq -lt 0) { continue }
+    $newRaw = $raw.Substring(0, $rawEq + 1) + $Value
+    if ($newRaw -ne $raw) { $parts[$i] = $newRaw }
+    return ($parts -join '')
+  }
+  return $Text
+}
+
+# PersistedSettings.json holds the same names as ["name": X, "value": "Y"] pairs.
+# A hand-rolled two-step replace keeps the file's layout and encoding intact.
+function Set-PcbLolPersistedValue([string]$Text, [string]$Name, [string]$Value) {
+  # One match covers the name and the "value" pair that follows it.  Matching the pair
+  # together keeps the indices stable, and it is why nothing here needs a start offset:
+  # the previous version matched the value with a '^'-anchored pattern at a non-zero
+  # offset, which can never succeed, so the JSON was silently never updated.
+  $pat = '("name"\s*:\s*"' + [regex]::Escape($Name) + '"\s*,\s*\r?\n\s*"value"\s*:\s*")([^"]*)(")'
+  $rx = [regex]::new($pat)
+  $hits = $rx.Matches($Text).Count
+  if ($hits -eq 0) { return [pscustomobject]@{ Text = $Text; Count = 0; Changed = 0 } }
+  $counter = @{ n = 0 }
+  $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{
+    param($m)
+    if ($m.Groups[2].Value -eq $Value) { return $m.Value }
+    $counter['n'] = $counter['n'] + 1
+    return ($m.Groups[1].Value + $Value + $m.Groups[3].Value)
+  }
+  $out = $rx.Replace($Text, $evaluator)
+  return [pscustomobject]@{ Text = $out; Count = $hits; Changed = [int]$counter['n'] }
+}
+
+# The stored record arrives in two shapes: the PSCustomObject main.ps1 writes to state.json,
+# and the PSCustomObject ConvertFrom-Json rebuilds on a revert run.  Its Sha map comes back
+# as a PSCustomObject there, so a plain .ContainsKey()/.Item() read throws on a revert.
+function Get-PcbRecField($Rec, [string]$Name) {
+  if ($null -eq $Rec) { return $null }
+  if ($Rec -is [System.Collections.IDictionary]) {
+    if ($Rec.Contains($Name)) { return $Rec[$Name] }
+    return $null
+  }
+  $p = $Rec.PSObject.Properties[$Name]
+  if ($null -ne $p) { return $p.Value }
+  return $null
+}
+
+function Get-PcbRecKey($Map, [string]$Key) {
+  if ($null -eq $Map) { return $null }
+  if ($Map -is [System.Collections.IDictionary]) {
+    if ($Map.Contains($Key)) { return $Map[$Key] }
+    return $null
+  }
+  $p = $Map.PSObject.Properties[$Key]
+  if ($null -ne $p) { return $p.Value }
+  return $null
+}
+
+function Get-PcbLolCfgSha([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path)) { return 'absent' }
+  try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash } catch { return 'error' }
+}
+
+function Write-PcbLolText([string]$Path, [string]$Text, [string]$OriginalText) {
+  # keep a byte order mark exactly as it was, so a file that did not change stays identical
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  if ($OriginalText.Length -gt 0 -and $OriginalText[0] -eq [char]0xFEFF) { $enc = New-Object System.Text.UTF8Encoding($true) }
+  [System.IO.File]::WriteAllText($Path, $Text, $enc)
+}
+
+function Set-PcbLolCfg {
+  param($State, [string]$BackupDir = '')
+  $rows = New-Object System.Collections.ArrayList
+  $rec = [pscustomobject]@{ Ok = $false; Rows = @(); Backup = $null; Applied = $null; Error = '' }
+  try {
+    if (Test-PcbLolRunning) {
+      [void]$rows.Add([pscustomobject]@{ Item = 'lol/cfg'; Before = 'n/a'; After = 'n/a'; Status = 'SKIP: close the game first' })
+      $rec.Ok = $true
+      $rec.Rows = @($rows)
+      return $rec
+    }
+    if ($null -eq $State) { $State = Get-PcbLolCfgState }
+    if ($null -eq $State -or -not $State.Available) {
+      $msg = 'Config dir unavailable'
+      if ($null -ne $State -and -not [string]::IsNullOrWhiteSpace([string]$State.Error)) { $msg = [string]$State.Error }
+      [void]$rows.Add([pscustomobject]@{ Item = 'lol/cfg'; Before = 'n/a'; After = 'n/a'; Status = ('SKIP: ' + $msg) })
+      $rec.Ok = $true
+      $rec.Rows = @($rows)
+      $rec.Error = $msg
+      return $rec
+    }
+    $dir = [string]$State.Dir
+    $sep = [string]$State.Sep
+    if ([string]::IsNullOrEmpty($sep)) { $sep = "`r`n" }
+    $cfgPath = Join-Path $dir 'game.cfg'
+    $perPath = Join-Path $dir 'PersistedSettings.json'
+
+    # backup first: a byte copy is what makes the revert exact
+    if ([string]::IsNullOrWhiteSpace($BackupDir)) { $BackupDir = Join-Path $StateDir 'lolcfg-backup' }
+    if (-not (Test-Path -LiteralPath $BackupDir)) { New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null }
+    $bak = [pscustomobject]@{ Dir = $BackupDir; TargetDir = $dir; Files = @(); Sha = @{} }
+    $shaBefore = @{}
+    foreach ($f in $script:PcbLolCfgFiles) {
+      $src = Join-Path $dir $f
+      $shaBefore[$f] = Get-PcbLolCfgSha $src
+      if (-not (Test-Path -LiteralPath $src)) { continue }
+      Copy-Item -LiteralPath $src -Destination (Join-Path $BackupDir $f) -Force -ErrorAction Stop
+      $bak.Files = @($bak.Files) + @($f)
+    }
+    $bak.Sha = $shaBefore
+    $rec.Backup = $bak
+
+    $cfgText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($cfgPath))
+    $newCfg = $cfgText
+    foreach ($v in $script:PcbLolCfgValues) {
+      $newCfg = Set-PcbLolCfgIniValue $newCfg $v.Section $v.Name ([string]$v.Value) $sep
+    }
+    $perText = ''
+    $newPer = ''
+    if (Test-Path -LiteralPath $perPath) {
+      $perText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($perPath))
+      $newPer = $perText
+      foreach ($v in $script:PcbLolCfgValues) {
+        $r = Set-PcbLolPersistedValue $newPer $v.Name ([string]$v.Value)
+        $newPer = [string]$r.Text
+      }
+    }
+
+    $wrote = [pscustomobject]@{ Cfg = $false; Persisted = $false; Sha = @{} }
+    if ($newCfg -ne $cfgText) {
+      Write-PcbLolText $cfgPath $newCfg $cfgText
+      $wrote.Cfg = $true
+    }
+    if ($newPer.Length -gt 0 -and $newPer -ne $perText) {
+      Write-PcbLolText $perPath $newPer $perText
+      $wrote.Persisted = $true
+    }
+    $wrote.Sha = @{ Cfg = (Get-PcbLolCfgSha $cfgPath); Persisted = (Get-PcbLolCfgSha $perPath) }
+    $rec.Applied = $wrote
+
+    # live read-back: re-read game.cfg and report what is on disk now
+    $after = Get-PcbLolCfgState -Dir $dir
+    $map = @{}
+    if ($null -ne $after -and $null -ne $after.Rows) {
+      foreach ($r in @($after.Rows)) { $map[[string]$r.Section + '/' + [string]$r.Name] = [string]$r.Before }
+    }
+    foreach ($v in $script:PcbLolCfgValues) {
+      $key = $v.Section + '/' + $v.Name
+      $before = '(absent)'
+      foreach ($r in @($State.Rows)) { if (([string]$r.Section + '/' + [string]$r.Name) -eq $key) { $before = [string]$r.Before } }
+      $now = '(absent)'
+      if ($map.ContainsKey($key)) { $now = [string]$map[$key] }
+      if ($now -eq [string]$v.Value) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $key); Before = $before; After = $now; Status = 'OK' })
+      } else {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $key); Before = $before; After = $now; Status = 'FAIL: read-back differs' })
+      }
+    }
+    $rec.Ok = $true
+    $rec.Rows = @($rows)
+  } catch {
+    $rec.Ok = $false
+    $rec.Error = $_.Exception.Message
+    [void]$rows.Add([pscustomobject]@{ Item = 'lol/cfg'; Before = 'unknown'; After = 'unknown'; Status = ('FAIL: ' + $_.Exception.Message) })
+    $rec.Rows = @($rows)
+  }
+  return $rec
+}
+
+function Restore-PcbLolCfg {
+  param($Rec)
+  $rows = New-Object System.Collections.ArrayList
+  $out = [pscustomobject]@{ Ok = $false; Rows = @(); Error = '' }
+  try {
+    $bak = Get-PcbRecField $Rec 'Backup'
+    if ($null -eq $Rec -or $null -eq $bak) {
+      $out.Error = 'nothing recorded'
+      return $out
+    }
+    $applied = Get-PcbRecField $Rec 'Applied'
+    $bakSha = Get-PcbRecField $bak 'Sha'
+    $targetDir = [string](Get-PcbRecField $bak 'TargetDir')
+    foreach ($f in @(Get-PcbRecField $bak 'Files')) {
+      if ($null -eq $f) { continue }
+      $src = Join-Path ([string](Get-PcbRecField $bak 'Dir')) ([string]$f)
+      if (-not (Test-Path -LiteralPath $src)) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $f); Before = '(tuned)'; After = 'unknown'; Status = 'SKIP: backup missing' })
+        continue
+      }
+      # only restore a file the kit actually rewrote
+      $touched = $false
+      if ($null -ne $applied) {
+        if ($f -eq 'game.cfg' -and [bool](Get-PcbRecField $applied 'Cfg')) { $touched = $true }
+        if ($f -eq 'PersistedSettings.json' -and [bool](Get-PcbRecField $applied 'Persisted')) { $touched = $true }
+      }
+      if (-not $touched) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $f); Before = '(untouched)'; After = '(untouched)'; Status = 'SKIP: not written by the kit' })
+        continue
+      }
+      if ([string]::IsNullOrWhiteSpace($targetDir)) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $f); Before = '(tuned)'; After = 'unknown'; Status = 'FAIL: target dir unknown' })
+        continue
+      }
+      $dstPath = Join-Path $targetDir ([string]$f)
+      [System.IO.File]::Copy($src, $dstPath, $true)
+      $now = Get-PcbLolCfgSha $dstPath
+      $want = 'absent'
+      $wantSha = Get-PcbRecKey $bakSha ([string]$f)
+      if ($null -ne $wantSha -and -not [string]::IsNullOrWhiteSpace([string]$wantSha)) { $want = [string]$wantSha }
+      if ($now -eq $want) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $f); Before = '(tuned)'; After = 'restored'; Status = 'OK' })
+      } else {
+        [void]$rows.Add([pscustomobject]@{ Item = ('lol/' + $f); Before = '(tuned)'; After = 'sha differs'; Status = 'FAIL: sha256 mismatch after restore' })
+      }
+    }
+    $out.Ok = $true
+    $out.Rows = @($rows)
+  } catch {
+    $out.Ok = $false
+    $out.Error = $_.Exception.Message
+  }
+  return $out
+}
+
+# ==== end lolcfg.ps1 ====
+
+# ==== begin boot.ps1 ====
+# W-RB1 - boot-time tweaks: BCD store values and the boot-read HKLM values.
+# Pure Windows PowerShell 5.1, single file, ASCII only, no network, nothing throws
+# (every failure comes back with Ok=$false and an Error string).
+#
+# Public API:
+#   Invoke-PcbBcd -Args <string[]>   -> @{ Code; Out }     the ONLY place that runs the
+#                                                          BCD editor; -Args is the
+#                                                          verb list, no /store included
+#   Get-PcbBootCurrentId             -> '{guid}' or $null  GUID of {current} in the system store
+#   Get-PcbBootIfGuid                -> '{guid}' or $null  IPv4 default route, lowest
+#                                                          RouteMetric+InterfaceMetric
+#   Get-PcbBootPlan [-BcdId <guid>]  -> @(@{ Kind; Item; Before; Want })   read-only
+#   Get-PcbBootBitLocker             -> @{ Present; ProtectionOn; Error }
+#   Suspend-PcbBootBitLocker         -> @{ Ok; Error }      DisableKeyProtectors DisableCount=1
+#   Set-PcbBoot [-BcdId <g>] [-SkipBcd] [-SkipReg] -> @{ Ok; Rows; Rec; Error }
+#   Restore-PcbBoot -Rec <r> [-Exclude <string[]>] -> @{ Ok; Rows; Kept; Error }
+#   New-PcbBootEntry -Description <text> -> @{ Ok; Id; Error }
+#   Remove-PcbBootEntry -Id <guid>       -> @{ Ok; Error }
+#   Set-PcbBootSequence -Id <guid>       -> @{ Ok; Error }
+#   Clear-PcbBootSequence                -> @{ Ok; Error }
+#
+# Seams (tests only):
+#   $script:PcbBootBcdStore   '' = system store; else the path of an exported copy.  Every
+#                             call into the BCD editor is prefixed with /store <that>.
+#   $script:PcbBootRegRoot    '' = real HKLM; else 'HKCU:\Software\pcbang-test-boot' and
+#                             HKLM:\X is read/written as <root>\HKLM\X.
+#   $script:PcbBootIfGuid     '' = auto; else the injected interface GUID.
+#   $script:PcbBootTestGuard  $true = throw on any write verb without /store.
+#   $script:PcbBootBitLockerProbe / -Suspend  scriptblock replacements for the live calls,
+#                             so no test ever suspends real protection.
+#
+# Why the GUID: {current} resolves only in the system store.  An exported copy keeps the
+# entry GUIDs but not the alias, so the module resolves the GUID once and passes it to
+# every call.  (probe: export rc=0, /store <copy> /enum {f417c0ea-...} works,
+# /store <copy> /enum {current} errors - tests\_raw\opus-rb-premises.txt:1-3)
+#
+# The home {"current"} values are the ones p55.ps1 / p32.ps1 set, and every registry row
+# below equals the live home value (tests\_raw\opus-rb-premises.txt, read 2026-11-02).
+# Two decisions that are NOT home facts:
+#   HwSchMode: home holds 0 and the kit writes 1, because 1 = Off is what the Windows
+#     Settings toggle writes (2 = On) and 0 is undocumented.  Parent design decision.
+#   BitLocker: changing BCD on a protected drive can force a recovery prompt, so
+#     protection is suspended (DisableCount=1) before the first BCD write.
+#
+# Tcp1323Opts=0 is live at home but no home script ever wrote it -> not a kit tweak.
+# MemoryCompression is ON at home (INV1 row 169) -> excluded here.
+
+$script:PcbBootBcdStore = ''
+$script:PcbBootRegRoot = ''
+$script:PcbBootIfGuid = ''
+$script:PcbBootTestGuard = $false
+$script:PcbBootBitLockerProbe = $null
+$script:PcbBootBitLockerSuspend = $null
+
+# The BCD editor's write verbs.  /export and /enum are READs of the store: they stay
+# allowed with the guard on, because the whole-store backup is an /export.
+$script:PcbBootWriteVerbs = @('/set', '/deletevalue', '/import', '/create', '/copy', '/delete', '/displayorder', '/bootsequence', '/default', '/timeout')
+
+# Value = $null means "must be absent" (deletevalue when present).
+$script:PcbBootBcdRows = @(
+  @{ Name = 'disabledynamictick'; Value = 'Yes' },
+  @{ Name = 'tscsyncpolicy';      Value = 'Enhanced' },
+  @{ Name = 'useplatformtick';    Value = $null },
+  @{ Name = 'useplatformclock';   Value = $null },
+  @{ Name = 'hypervisorlaunchtype'; Value = 'Off' },
+  @{ Name = 'vsmlaunchtype';      Value = 'Off' },
+  @{ Name = 'tpmbootentropy';     Value = 'ForceDisable' },
+  @{ Name = 'disableelamdrivers'; Value = 'Yes' },
+  @{ Name = 'bootux';             Value = 'Disabled' },
+  @{ Name = 'bootmenupolicy';     Value = 'Legacy' },
+  @{ Name = 'recoveryenabled';    Value = 'No' },
+  @{ Name = 'lastknowngood';      Value = 'No' },
+  @{ Name = 'nx';                 Value = 'OptIn' },
+  @{ Name = 'linearaddress57';    Value = 'OptOut' }
+)
+
+# Cond = 'keyexists' means: only touch this row when its key is already there (Tcpip6).
+$script:PcbBootRegRows = @(
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name = 'GlobalTimerResolutionRequests'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name = 'SerializeTimerExpiration'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name = 'DistributeTimers'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name = 'CoalescingTimerInterval'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; Name = 'HiberbootEnabled'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; Name = 'HwSchMode'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'; Name = 'TdrDelay'; Kind = 'DWord'; Value = 4 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler'; Name = 'EnablePreemption'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\Scheduler'; Name = 'PreemptionGranularity'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\mouclass\Parameters'; Name = 'MouseDataQueueSize'; Kind = 'DWord'; Value = 200 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\kbdclass\Parameters'; Name = 'KeyboardDataQueueSize'; Kind = 'DWord'; Value = 200 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'TcpAckFrequency'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'TCPNoDelay'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'TcpDelayedAckTicks'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'TcpMaxDataRetransmissions'; Kind = 'DWord'; Value = 5 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'MaxUserPort'; Kind = 'DWord'; Value = 65534 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'TcpTimedWaitDelay'; Kind = 'DWord'; Value = 30 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'; Name = 'DefaultTTL'; Kind = 'DWord'; Value = 64 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\<IF>'; Name = 'TcpAckFrequency'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\<IF>'; Name = 'TCPNoDelay'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\<IF>'; Name = 'TcpDelayedAckTicks'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\<IF>'; Name = 'TcpAckFrequency'; Kind = 'DWord'; Value = 1; Cond = 'keyexists' },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\<IF>'; Name = 'TCPNoDelay'; Kind = 'DWord'; Value = 1; Cond = 'keyexists' },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\AFD\Parameters'; Name = 'DefaultReceiveWindow'; Kind = 'DWord'; Value = 64240 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Services\AFD\Parameters'; Name = 'DefaultSendWindow'; Kind = 'DWord'; Value = 64240 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; Name = 'FeatureSettingsOverride'; Kind = 'DWord'; Value = 536870915 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; Name = 'FeatureSettingsOverrideMask'; Kind = 'DWord'; Value = 536870915 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'; Name = 'DisablePagingExecutive'; Kind = 'DWord'; Value = 1 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Executive'; Name = 'AdditionalCriticalWorkerThreads'; Kind = 'DWord'; Value = 4 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Executive'; Name = 'AdditionalDelayedWorkerThreads'; Kind = 'DWord'; Value = 8 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'; Name = 'EnableVirtualizationBasedSecurity'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'; Name = 'RequirePlatformSecurityFeatures'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'; Name = 'Enabled'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity'; Name = 'WasEnabledBy'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name = 'EnableVirtualizationBasedSecurity'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name = 'HypervisorEnforcedCodeIntegrity'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceGuard'; Name = 'LsaCfgFlags'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'LsaCfgFlags'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; Name = 'NetworkThrottlingIndex'; Kind = 'DWord'; Value = 4294967295 },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'; Name = 'SystemResponsiveness'; Kind = 'DWord'; Value = 0 },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; Name = 'GPU Priority'; Kind = 'DWord'; Value = 8 },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; Name = 'Priority'; Kind = 'DWord'; Value = 6 },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; Name = 'Scheduling Category'; Kind = 'String'; Value = 'High' },
+  @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games'; Name = 'SFIO Priority'; Kind = 'String'; Value = 'High' }
+)
+
+# The stored record arrives in two shapes (the object main.ps1 keeps, and the one that
+# ConvertFrom-Json rebuilds on a revert run), so reads go through one accessor.
+function Get-PcbRecField($Rec, [string]$Name) {
+  if ($null -eq $Rec) { return $null }
+  if ($Rec -is [System.Collections.IDictionary]) {
+    if ($Rec.Contains($Name)) { return $Rec[$Name] }
+    return $null
+  }
+  $p = $Rec.PSObject.Properties[$Name]
+  if ($null -ne $p) { return $p.Value }
+  return $null
+}
+
+# $Args is an automatic variable in PowerShell: a parameter of that name binds only when
+# it is passed by name, so this helper takes its list under a name of its own.
+function ConvertTo-PcbBootArgLine([string[]]$ArgList) {
+  $parts = @()
+  foreach ($a in @($ArgList)) {
+    $s = [string]$a
+    if ($s -eq '') { $parts += '""'; continue }
+    if ($s -match '[ \t"]') { $parts += ('"' + ($s -replace '"', '\"') + '"') } else { $parts += $s }
+  }
+  return ($parts -join ' ')
+}
+
+function Invoke-PcbBootExe([string]$File, [string]$ArgLine) {
+  $rec = @{ Code = -1; Out = '' }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File
+    $psi.Arguments = $ArgLine
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # the editor writes OEM-encoded text; pin it so two reads of the same state are
+    # byte-for-byte identical as strings
+    $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+    $psi.StandardOutputEncoding = $oem
+    $psi.StandardErrorEncoding = $oem
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $so = $p.StandardOutput.ReadToEnd()
+    $se = $p.StandardError.ReadToEnd()
+    [void]$p.WaitForExit()
+    $rec.Code = $p.ExitCode
+    $rec.Out = [string]$so
+    if (-not [string]::IsNullOrEmpty($se)) { $rec.Out = $rec.Out + $se }
+    try { $p.Dispose() } catch { }
+  } catch {
+    $rec.Code = -1
+    $rec.Out = [string]$_.Exception.Message
+  }
+  return $rec
+}
+
+# The single call site.  Every other function goes through here.
+# -Args IS part of the published API (W-RB2 passes it by name), so it stays; the value is
+# then handed to the helpers under a plain name.
+function Invoke-PcbBcd {
+  [CmdletBinding()]
+  param([string[]]$Args = @())
+
+  $list = @()
+  foreach ($a in @($Args)) { $list += [string]$a }
+  $store = [string]$script:PcbBootBcdStore
+  $writes = $false
+  foreach ($a in $list) {
+    if ($script:PcbBootWriteVerbs -contains ([string]$a).ToLowerInvariant()) { $writes = $true }
+  }
+  if ($script:PcbBootTestGuard -and $writes -and [string]::IsNullOrWhiteSpace($store)) {
+    throw 'test guard: write verb without /store'
+  }
+
+  $full = @()
+  if (-not [string]::IsNullOrWhiteSpace($store)) { $full += @('/store', $store) }
+  foreach ($a in $list) { $full += [string]$a }
+
+  $exe = Join-Path $env:SystemRoot 'System32\bcdedit.exe'
+  $rec = Invoke-PcbBootExe $exe (ConvertTo-PcbBootArgLine $full)
+  return [pscustomobject]@{ Code = [int]$rec.Code; Out = [string]$rec.Out }
+}
+
+# Value of one element in an `enum <guid> /v` dump, or $null when the element is absent.
+# Element names and their values are English on a Korean Windows (only headers are
+# localized), so a name + value line match is safe.
+function Get-PcbBootBcdField([string]$Text, [string]$Name) {
+  if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+  if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
+  foreach ($line in ($Text -split "`r?`n")) {
+    $m = [regex]::Match($line, '^\s*([A-Za-z][A-Za-z0-9_\.\-]*)[ \t]+(\S.*?)\s*$')
+    if (-not $m.Success) { continue }
+    if ($m.Groups[1].Value -ne $Name) { continue }
+    return $m.Groups[2].Value.Trim()
+  }
+  return $null
+}
+
+# {current} is an alias that only resolves in the system store, so this one call always
+# runs against the system store: it drops the store prefix for the duration of the call.
+function Get-PcbBootCurrentId {
+  $saved = [string]$script:PcbBootBcdStore
+  $script:PcbBootBcdStore = ''
+  $rec = $null
+  try { $rec = Invoke-PcbBcd -Args @('/enum', '{current}', '/v') } finally { $script:PcbBootBcdStore = $saved }
+  if ($null -eq $rec) { return $null }
+  if ([int]$rec.Code -ne 0) { return $null }
+  # `/enum {current} /v` prints exactly one loader block, so exactly one identifier line.
+  # Anything else means the command did not run as intended (plain `/enum` lists {bootmgr}
+  # and every displayed entry, and its last identifier is another loader); a wrong GUID here
+  # would aim every write at another entry, so refuse instead of guessing.
+  $ms = [regex]::Matches([string]$rec.Out, '(?im)^\s*identifier\s+(\{[0-9A-Fa-f\-]+\})\s*$')
+  if ($ms.Count -ne 1) { return $null }
+  return $ms[0].Groups[1].Value
+}
+
+function Get-PcbBootIfGuid {
+  if (-not [string]::IsNullOrWhiteSpace([string]$script:PcbBootIfGuid)) { return [string]$script:PcbBootIfGuid }
+  try {
+    $routes = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop)
+    if ($routes.Count -eq 0) { return $null }
+    $best = $routes | Sort-Object { [int]$_.RouteMetric + [int]$_.InterfaceMetric } | Select-Object -First 1
+    if ($null -eq $best) { return $null }
+    $ad = Get-NetAdapter -InterfaceIndex ([int]$best.InterfaceIndex) -ErrorAction Stop
+    if ($null -eq $ad) { return $null }
+    $g = [string]$ad.InterfaceGuid
+    if ([string]::IsNullOrWhiteSpace($g)) { return $null }
+    return $g
+  } catch {
+    return $null
+  }
+}
+
+# HKLM:\X -> <root>\HKLM\X when a test root is set; <IF> -> the resolved interface GUID.
+function Get-PcbBootRegPath([string]$Path) {
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+  $p = [string]$Path
+  if ($p.IndexOf('<IF>', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    $g = Get-PcbBootIfGuid
+    if ([string]::IsNullOrWhiteSpace([string]$g)) { return $null }
+    $p = $p.Replace('<IF>', [string]$g)
+  }
+  $root = [string]$script:PcbBootRegRoot
+  if ([string]::IsNullOrWhiteSpace($root)) { return $p }
+  $trim = $root.TrimEnd('\')
+  if ($p.Length -ge 5 -and $p.Substring(0, 5).ToUpperInvariant() -eq 'HKLM:') {
+    return ($trim + '\HKLM\' + $p.Substring(5).TrimStart('\'))
+  }
+  if ($p.Length -ge 5 -and $p.Substring(0, 5).ToUpperInvariant() -eq 'HKCU:') {
+    return ($trim + '\HKCU\' + $p.Substring(5).TrimStart('\'))
+  }
+  return $p
+}
+
+# DWord values come back as UInt32 when the high bit is set; normalise to Int64 so a
+# table value of 4294967295 and a read of -1 compare equal.
+function ConvertTo-PcbBootNormDword($Value) {
+  if ($null -eq $Value) { return $null }
+  try {
+    if ($Value -is [int]) { if ([int]$Value -lt 0) { return ([int64]$Value + 4294967296) }; return [int64]$Value }
+    return [int64]$Value
+  } catch {
+    return $null
+  }
+}
+
+function Get-PcbBootRegValue([string]$Path, [string]$Name) {
+  $rec = @{ Existed = $false; Value = $null; Kind = 'DWord'; KeyExists = $false }
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $rec }
+  if (-not (Test-Path -LiteralPath $Path)) { return $rec }
+  $rec.KeyExists = $true
+  $item = $null
+  try { $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop } catch { return $rec }
+  if ($null -eq $item) { return $rec }
+  $val = $null
+  try { $val = $item.$Name } catch { return $rec }
+  if ($null -eq $val) { return $rec }
+  $rec.Existed = $true
+  $kind = 'DWord'
+  try { $kind = (Get-Item -LiteralPath $Path).GetValueKind($Name).ToString() } catch { }
+  $rec.Kind = $kind
+  if ($kind -eq 'DWord') { $rec.Value = ConvertTo-PcbBootNormDword $val } else { $rec.Value = $val }
+  return $rec
+}
+
+function Set-PcbBootRegValue([string]$Path, [string]$Name, [string]$Kind, $Value) {
+  if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+  if ($Kind -eq 'DWord') {
+    $v = [int64]$Value
+    if ($v -gt 2147483647) { $v = $v - 4294967296 }
+    if ($v -lt -2147483648) { $v = $v + 4294967296 }
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([int]$v) -PropertyType DWord -Force | Out-Null
+  } else {
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([string]$Value) -PropertyType String -Force | Out-Null
+  }
+}
+
+function Test-PcbBootRegAtWant($Have, $Row) {
+  if (-not $Have.Existed) { return $false }
+  if ([string]$Have.Kind -ne [string]$Row.Kind) { return $false }
+  if ($Row.Kind -eq 'DWord') {
+    $a = ConvertTo-PcbBootNormDword $Have.Value
+    $b = ConvertTo-PcbBootNormDword $Row.Value
+    if ($null -eq $a -or $null -eq $b) { return $false }
+    return ([int64]$a -eq [int64]$b)
+  }
+  return ([string]$Have.Value -ceq [string]$Row.Value)
+}
+
+function Get-PcbBootPlan {
+  param([string]$BcdId = '')
+
+  $rows = New-Object System.Collections.ArrayList
+  $text = ''
+  $id = [string]$BcdId
+  if ([string]::IsNullOrWhiteSpace($id)) { $id = Get-PcbBootCurrentId }
+  if (-not [string]::IsNullOrWhiteSpace($id)) {
+    $r = Invoke-PcbBcd -Args @('/enum', [string]$id, '/v')
+    if ([int]$r.Code -eq 0) { $text = [string]$r.Out }
+  }
+  foreach ($row in @($script:PcbBootBcdRows)) {
+    [void]$rows.Add([pscustomobject]@{ Kind = 'bcd'; Item = [string]$row.Name; Before = (Get-PcbBootBcdField $text ([string]$row.Name)); Want = $row.Value })
+  }
+  foreach ($row in @($script:PcbBootRegRows)) {
+    $item = ([string]$row.Path) + ' :: ' + ([string]$row.Name)
+    $path = Get-PcbBootRegPath ([string]$row.Path)
+    $before = $null
+    if (-not [string]::IsNullOrWhiteSpace([string]$path)) {
+      $have = Get-PcbBootRegValue $path ([string]$row.Name)
+      if ($have.Existed) { $before = $have.Value }
+    }
+    [void]$rows.Add([pscustomobject]@{ Kind = 'reg'; Item = $item; Before = $before; Want = $row.Value })
+  }
+  return @($rows)
+}
+
+function Get-PcbBootBitLocker {
+  $rec = [pscustomobject]@{ Present = $false; ProtectionOn = $false; Error = '' }
+  if ($null -ne $script:PcbBootBitLockerProbe) {
+    try {
+      $r = & $script:PcbBootBitLockerProbe
+      if ($null -ne $r) {
+        $p = Get-PcbRecField $r 'Present'
+        $o = Get-PcbRecField $r 'ProtectionOn'
+        $e = Get-PcbRecField $r 'Error'
+        $rec.Present = [bool]$p
+        $rec.ProtectionOn = [bool]$o
+        if ($null -ne $e) { $rec.Error = [string]$e }
+      }
+    } catch {
+      $rec.Error = [string]$_.Exception.Message
+    }
+    return $rec
+  }
+  try {
+    $vols = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop)
+    $rec.Present = $true
+    $letter = ([string]$env:SystemDrive).TrimEnd(':')
+    foreach ($v in $vols) {
+      if ($null -eq $v) { continue }
+      $dl = [string]$v.DriveLetter
+      if ($dl -ne '' -and $dl.TrimEnd(':') -ne $letter) { continue }
+      if ([int]$v.ProtectionStatus -ne 0) { $rec.ProtectionOn = $true }
+    }
+  } catch {
+    $rec.Present = $false
+    $rec.Error = [string]$_.Exception.Message
+  }
+  return $rec
+}
+
+function Suspend-PcbBootBitLocker {
+  if ($null -ne $script:PcbBootBitLockerSuspend) {
+    try {
+      $r = & $script:PcbBootBitLockerSuspend
+      $ok = Get-PcbRecField $r 'Ok'
+      $err = Get-PcbRecField $r 'Error'
+      $msg = ''
+      if ($null -ne $err) { $msg = [string]$err }
+      return [pscustomobject]@{ Ok = [bool]$ok; Error = $msg }
+    } catch {
+      return [pscustomobject]@{ Ok = $false; Error = [string]$_.Exception.Message }
+    }
+  }
+  try {
+    $vols = @(Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -ErrorAction Stop)
+    $letter = ([string]$env:SystemDrive).TrimEnd(':')
+    $target = $null
+    foreach ($v in $vols) {
+      $dl = [string]$v.DriveLetter
+      if ($dl -ne '' -and $dl.TrimEnd(':') -eq $letter) { $target = $v; break }
+    }
+    if ($null -eq $target) { return [pscustomobject]@{ Ok = $false; Error = 'system volume not found' } }
+    $res = Invoke-CimMethod -InputObject $target -MethodName 'DisableKeyProtectors' -Arguments @{ DisableCount = [uint32]1 } -ErrorAction Stop
+    if ($null -eq $res) { return [pscustomobject]@{ Ok = $false; Error = 'no result' } }
+    if ([uint32]$res.ReturnValue -eq 0) { return [pscustomobject]@{ Ok = $true; Error = '' } }
+    return [pscustomobject]@{ Ok = $false; Error = ('ReturnValue=' + [string]$res.ReturnValue) }
+  } catch {
+    return [pscustomobject]@{ Ok = $false; Error = [string]$_.Exception.Message }
+  }
+}
+
+function Set-PcbBoot {
+  param([string]$BcdId = '', [switch]$SkipBcd, [switch]$SkipReg)
+
+  $rows = New-Object System.Collections.ArrayList
+  $bcdRec = New-Object System.Collections.ArrayList
+  $regRec = New-Object System.Collections.ArrayList
+  $res = [pscustomobject]@{ Ok = $false; Rows = @(); Rec = $null; Error = '' }
+
+  try {
+    $id = [string]$BcdId
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = Get-PcbBootCurrentId }
+    $text = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$id)) {
+      $r = Invoke-PcbBcd -Args @('/enum', [string]$id, '/v')
+      if ([int]$r.Code -eq 0) { $text = [string]$r.Out }
+    }
+
+    # BitLocker first: a BCD change on a protected volume can ask for the recovery key.
+    $skipReason = ''
+    if ($SkipBcd) {
+      $skipReason = '-SkipBcd'
+    } else {
+      if ([string]::IsNullOrWhiteSpace([string]$id)) {
+        $skipReason = '{current} not resolved'
+      } else {
+        $bl = Get-PcbBootBitLocker
+        if ($bl.ProtectionOn) {
+          $sus = Suspend-PcbBootBitLocker
+          if (-not $sus.Ok) { $skipReason = 'bitlocker suspend failed' }
+        }
+      }
+    }
+
+    foreach ($row in @($script:PcbBootBcdRows)) {
+      $name = [string]$row.Name
+      $want = $row.Value
+      $before = $null
+      $existed = $false
+      if (-not [string]::IsNullOrEmpty($text)) {
+        $before = Get-PcbBootBcdField $text $name
+        if ($null -ne $before) { $existed = $true }
+      }
+      [void]$bcdRec.Add([pscustomobject]@{ Name = $name; Existed = $existed; Value = $before })
+
+      if (-not [string]::IsNullOrEmpty($skipReason)) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = $before; Status = ('SKIP: ' + $skipReason) })
+        continue
+      }
+
+      if ($null -eq $want) {
+        if (-not $existed) {
+          [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $null; After = $null; Status = 'OK (already)' })
+          continue
+        }
+        $w = Invoke-PcbBcd -Args @('/deletevalue', [string]$id, $name)
+        if ([int]$w.Code -eq 0) {
+          [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = $null; Status = 'OK' })
+        } else {
+          [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = $before; Status = ('FAIL: ' + ([string]$w.Out).Trim()) })
+        }
+        continue
+      }
+
+      if ($existed -and ([string]$before -ieq [string]$want)) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = $before; Status = 'OK (already)' })
+        continue
+      }
+      $w = Invoke-PcbBcd -Args @('/set', [string]$id, $name, [string]$want)
+      if ([int]$w.Code -eq 0) {
+        [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = [string]$want; Status = 'OK' })
+      } else {
+        [void]$rows.Add([pscustomobject]@{ Item = ('bcd: ' + $name); Before = $before; After = $before; Status = ('FAIL: ' + ([string]$w.Out).Trim()) })
+      }
+    }
+
+    foreach ($row in @($script:PcbBootRegRows)) {
+      $item = ([string]$row.Path) + ' :: ' + ([string]$row.Name)
+      $name = [string]$row.Name
+      if ($SkipReg) {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'SKIP: -SkipReg' })
+        continue
+      }
+      $path = Get-PcbBootRegPath ([string]$row.Path)
+      if ([string]::IsNullOrWhiteSpace([string]$path)) {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'SKIP: interface guid unresolved' })
+        continue
+      }
+      if ([string]$row.Cond -eq 'keyexists' -and -not (Test-Path -LiteralPath $path)) {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'SKIP: key absent' })
+        continue
+      }
+      $have = Get-PcbBootRegValue $path $name
+      $keyCreated = -not $have.KeyExists
+      # the stored kind is the one that is really there, so a wrong-kind seed is restored
+      # as the kind it was, not as the kind the row wants
+      $recKind = [string]$row.Kind
+      if ($have.Existed) { $recKind = [string]$have.Kind }
+      [void]$regRec.Add([pscustomobject]@{ Path = $path; Name = $name; Kind = $recKind; Existed = [bool]$have.Existed; Value = $have.Value; KeyCreated = [bool]$keyCreated })
+
+      $before = $null
+      if ($have.Existed) { $before = $have.Value }
+
+      if (Test-PcbBootRegAtWant $have $row) {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $before; After = $before; Status = 'OK (already)' })
+        continue
+      }
+      try {
+        Set-PcbBootRegValue $path $name ([string]$row.Kind) $row.Value
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $before; After = $row.Value; Status = 'OK' })
+      } catch {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $before; After = $before; Status = ('FAIL: ' + [string]$_.Exception.Message) })
+      }
+    }
+
+    $res.Rows = @($rows)
+    $res.Rec = [pscustomobject]@{ BcdId = [string]$id; Bcd = @($bcdRec); Reg = @($regRec) }
+    $res.Ok = $true
+  } catch {
+    $res.Ok = $false
+    $res.Rows = @($rows)
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Restore-PcbBoot {
+  param($Rec, [string[]]$Exclude = @())
+
+  $rows = New-Object System.Collections.ArrayList
+  $kept = New-Object System.Collections.ArrayList
+  $res = [pscustomobject]@{ Ok = $false; Rows = @(); Kept = $null; Error = '' }
+
+  try {
+    if ($null -eq $Rec) { throw 'no record' }
+    $id = [string](Get-PcbRecField $Rec 'BcdId')
+    $bcdRows = @(Get-PcbRecField $Rec 'Bcd')
+    $regRows = @(Get-PcbRecField $Rec 'Reg')
+    $skipNames = @()
+    foreach ($x in @($Exclude)) {
+      if ($null -ne $x -and -not [string]::IsNullOrWhiteSpace([string]$x)) { $skipNames += ([string]$x).ToLowerInvariant() }
+    }
+
+    if ($bcdRows.Count -gt 0) {
+      $text = ''
+      if (-not [string]::IsNullOrWhiteSpace($id)) {
+        $r = Invoke-PcbBcd -Args @('/enum', [string]$id, '/v')
+        if ([int]$r.Code -eq 0) { $text = [string]$r.Out }
+      }
+      foreach ($row in $bcdRows) {
+        if ($null -eq $row) { continue }
+        $name = [string](Get-PcbRecField $row 'Name')
+        $existed = [bool](Get-PcbRecField $row 'Existed')
+        $want = Get-PcbRecField $row 'Value'
+        $item = 'bcd: ' + $name
+        if ([string]::IsNullOrWhiteSpace($id)) {
+          [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'FAIL: no BcdId in the record' })
+          continue
+        }
+        $have = Get-PcbBootBcdField $text $name
+        if ($existed) {
+          if ($null -ne $have -and ([string]$have -ieq [string]$want)) {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have; After = $have; Status = 'OK (already)' })
+            continue
+          }
+          $w = Invoke-PcbBcd -Args @('/set', $id, $name, [string]$want)
+          if ([int]$w.Code -eq 0) {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have; After = [string]$want; Status = 'OK' })
+          } else {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have; After = $have; Status = ('FAIL: ' + ([string]$w.Out).Trim()) })
+          }
+        } else {
+          if ($null -eq $have) {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'OK (already)' })
+            continue
+          }
+          $w = Invoke-PcbBcd -Args @('/deletevalue', $id, $name)
+          if ([int]$w.Code -eq 0) {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have; After = $null; Status = 'OK' })
+          } else {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have; After = $have; Status = ('FAIL: ' + ([string]$w.Out).Trim()) })
+          }
+        }
+      }
+    }
+
+    foreach ($row in $regRows) {
+      if ($null -eq $row) { continue }
+      $path = [string](Get-PcbRecField $row 'Path')
+      $name = [string](Get-PcbRecField $row 'Name')
+      $kind = [string](Get-PcbRecField $row 'Kind')
+      $existed = [bool](Get-PcbRecField $row 'Existed')
+      $keyCreated = [bool](Get-PcbRecField $row 'KeyCreated')
+      $want = Get-PcbRecField $row 'Value'
+      $item = $path + ' :: ' + $name
+      if ($skipNames -contains $name.ToLowerInvariant()) {
+        [void]$kept.Add($row)
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'SKIP: -Exclude' })
+        continue
+      }
+      if ([string]::IsNullOrWhiteSpace($path)) {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'FAIL: empty path in the record' })
+        continue
+      }
+      try {
+        $have = Get-PcbBootRegValue $path $name
+        if ($existed) {
+          $sameShape = ($have.Existed -and [string]$have.Kind -eq $kind)
+          $sameValue = $false
+          if ($sameShape) {
+            if ($kind -eq 'DWord') { $sameValue = ((ConvertTo-PcbBootNormDword $have.Value) -eq (ConvertTo-PcbBootNormDword $want)) }
+            else { $sameValue = ([string]$have.Value -ceq [string]$want) }
+          }
+          if ($sameShape -and $sameValue) {
+            [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have.Value; After = $have.Value; Status = 'OK (already)' })
+            continue
+          }
+          Set-PcbBootRegValue $path $name $kind $want
+          [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have.Value; After = $want; Status = 'OK' })
+        } else {
+          if ($have.Existed) { Remove-ItemProperty -LiteralPath $path -Name $name -Force -ErrorAction Stop }
+          elseif ($keyCreated) { [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = 'OK (already)' }); continue }
+          [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $have.Value; After = $null; Status = 'OK' })
+        }
+      } catch {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = $null; After = $null; Status = ('FAIL: ' + [string]$_.Exception.Message) })
+      }
+    }
+
+    # keys this run created go away again, but only while they are empty (a sibling row
+    # may still live under the same key)
+    foreach ($row in $regRows) {
+      if ($null -eq $row) { continue }
+      if (-not [bool](Get-PcbRecField $row 'KeyCreated')) { continue }
+      $path = [string](Get-PcbRecField $row 'Path')
+      if ([string]::IsNullOrWhiteSpace($path)) { continue }
+      if (-not (Test-Path -LiteralPath $path)) { continue }
+      $item = $path + ' :: <key>'
+      try {
+        $kids = @(Get-ChildItem -LiteralPath $path -ErrorAction SilentlyContinue)
+        $props = @((Get-Item -LiteralPath $path).Property)
+        if ($kids.Count -eq 0 -and $props.Count -eq 0) {
+          Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+          [void]$rows.Add([pscustomobject]@{ Item = $item; Before = 'present'; After = 'absent'; Status = 'OK' })
+        } else {
+          [void]$rows.Add([pscustomobject]@{ Item = $item; Before = 'present'; After = 'present'; Status = 'SKIP: key not empty' })
+        }
+      } catch {
+        [void]$rows.Add([pscustomobject]@{ Item = $item; Before = 'present'; After = 'present'; Status = ('FAIL: ' + [string]$_.Exception.Message) })
+      }
+    }
+
+    $res.Ok = $true
+  } catch {
+    $res.Ok = $false
+    $res.Error = [string]$_.Exception.Message
+  }
+  $res.Rows = @($rows)
+  $res.Kept = [pscustomobject]@{ BcdId = [string](Get-PcbRecField $Rec 'BcdId'); Bcd = @(); Reg = @($kept) }
+  return $res
+}
+
+# ---------------------------------------------------------------------------
+# The separate GAME boot entry (amendment 1)
+#
+# The 14 BCD rows live on a hidden copy of the boot loader, not on {current}, so every
+# normal boot stays the office boot.  The entry is entered once through
+# Set-PcbBootSequence and never shows up in the boot menu:
+#   /copy <resolved {current} GUID> /d "<text>"      -> new GUID, appended to displayorder
+#   /displayorder <id> /remove                       -> hides it again
+#   /bootsequence <id>                               -> one-time boot only
+#   /deletevalue {bootmgr} bootsequence              -> back to the normal boot
+#   /delete <id>                                     -> removes the entry
+# {current} does not resolve inside a store file, so the copy source is the resolved GUID,
+# and {bootmgr} does resolve there.  (probe: tests\_raw\opus-rb-entry-probe.txt:2-13 -
+# after create+hide+sequence+delete the copy's `/enum all /v` text is byte-identical)
+# ---------------------------------------------------------------------------
+
+# The boot manager entry: {bootmgr} resolves in the system store and inside a store file.
+$script:PcbBootManagerId = '{bootmgr}'
+# The only description the kit gives its entry; Remove-PcbBootEntry deletes nothing else.
+$script:PcbBootEntryDescription = 'Windows (pcbang game)'
+
+function Get-PcbBootEntryText([string]$Id) {
+  if ([string]::IsNullOrWhiteSpace($Id)) { return '' }
+  $r = Invoke-PcbBcd -Args @('/enum', [string]$Id, '/v')
+  if ([int]$r.Code -ne 0) { return '' }
+  return [string]$r.Out
+}
+
+function Get-PcbBootSequenceId {
+  $text = Get-PcbBootEntryText $script:PcbBootManagerId
+  if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+  foreach ($line in ($text -split "`r?`n")) {
+    $m = [regex]::Match($line, '^\s*bootsequence\s+(\{[0-9A-Fa-f\-]+\})\s*$')
+    if ($m.Success) { return $m.Groups[1].Value }
+  }
+  return $null
+}
+
+function New-PcbBootEntry {
+  param([string]$Description = $script:PcbBootEntryDescription)
+
+  $res = [pscustomobject]@{ Ok = $false; Id = $null; Error = '' }
+  try {
+    $src = Get-PcbBootCurrentId
+    if ([string]::IsNullOrWhiteSpace([string]$src)) { $res.Error = '{current} not resolved'; return $res }
+    $desc = [string]$Description
+    if ([string]::IsNullOrWhiteSpace($desc)) { $desc = $script:PcbBootEntryDescription }
+
+    $r = Invoke-PcbBcd -Args @('/copy', [string]$src, '/d', $desc)
+    if ([int]$r.Code -ne 0) { $res.Error = ('copy failed: ' + ([string]$r.Out).Trim()); return $res }
+    # the success line is localized; the GUID in it is not
+    $m = [regex]::Match([string]$r.Out, '\{[0-9A-Fa-f\-]+\}')
+    if (-not $m.Success) { $res.Error = ('copy returned no guid: ' + ([string]$r.Out).Trim()); return $res }
+    $newId = $m.Value
+    $res.Id = $newId
+
+    $h = Invoke-PcbBcd -Args @('/displayorder', $newId, '/remove')
+    if ([int]$h.Code -ne 0) {
+      # never leave a half-made entry behind
+      $d = Invoke-PcbBcd -Args @('/delete', $newId)
+      $res.Id = $null
+      $msg = ('hide failed: ' + ([string]$h.Out).Trim())
+      if ([int]$d.Code -ne 0) { $msg = $msg + ' / cleanup failed: ' + ([string]$d.Out).Trim() }
+      $res.Error = $msg
+      return $res
+    }
+    $res.Ok = $true
+  } catch {
+    $res.Ok = $false
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Set-PcbBootSequence {
+  param([string]$Id)
+
+  $res = [pscustomobject]@{ Ok = $false; Error = '' }
+  try {
+    if ([string]::IsNullOrWhiteSpace($Id)) { $res.Error = 'no id'; return $res }
+    $r = Invoke-PcbBcd -Args @('/bootsequence', [string]$Id)
+    if ([int]$r.Code -eq 0) { $res.Ok = $true } else { $res.Error = ([string]$r.Out).Trim() }
+  } catch {
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Clear-PcbBootSequence {
+  $res = [pscustomobject]@{ Ok = $false; Error = '' }
+  try {
+    $cur = Get-PcbBootSequenceId
+    if ($null -eq $cur) { $res.Ok = $true; return $res }
+    $r = Invoke-PcbBcd -Args @('/deletevalue', $script:PcbBootManagerId, 'bootsequence')
+    if ([int]$r.Code -eq 0) { $res.Ok = $true } else { $res.Error = ([string]$r.Out).Trim() }
+  } catch {
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Remove-PcbBootEntry {
+  param([string]$Id)
+
+  $res = [pscustomobject]@{ Ok = $false; Error = '' }
+  try {
+    if ([string]::IsNullOrWhiteSpace($Id)) { $res.Error = 'no id'; return $res }
+    $want = [string]$Id
+    # Only ever delete the kit's own entry: never the running loader, and only an entry whose
+    # description is the one New-PcbBootEntry wrote.  A corrupt game.json must not be able to
+    # delete the office entry.
+    $running = Get-PcbBootCurrentId
+    if ($null -eq $running) { $res.Error = 'refused: {current} not resolved'; return $res }
+    if ([string]$running -ieq $want) { $res.Error = 'refused: that is the running entry'; return $res }
+    $desc = Get-PcbBootBcdField (Get-PcbBootEntryText $want) 'description'
+    if ([string]$desc -cne [string]$script:PcbBootEntryDescription) {
+      $res.Error = ('refused: description is not the kit entry (' + [string]$desc + ')')
+      return $res
+    }
+    $cur = Get-PcbBootSequenceId
+    if ($null -ne $cur -and ([string]$cur -ieq $want)) {
+      $c = Clear-PcbBootSequence
+      if (-not $c.Ok) { $res.Error = ('clear bootsequence failed: ' + [string]$c.Error); return $res }
+    }
+    $r = Invoke-PcbBcd -Args @('/delete', $want)
+    if ([int]$r.Code -eq 0) { $res.Ok = $true } else { $res.Error = ([string]$r.Out).Trim() }
+  } catch {
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+# ==== end boot.ps1 ====
+
+# ==== begin usbscan.ps1 ====
+$script:PcbUsbS = @{
+  Title = [regex]::Unescape('USB \uD3EC\uD2B8 \uC810\uAC80 (pcbang)')
+  Hint = [regex]::Unescape('\uB9C8\uC6B0\uC2A4\uB97C \uC6C0\uC9C1\uC774\uACE0 \uD0A4\uBCF4\uB4DC \uC544\uBB34 \uD0A4\uB098 \uB204\uB974\uC138\uC694. \uB2E4\uB978 \uD3EC\uD2B8\uC5D0 \uAF42\uC73C\uBA74 \uBC14\uB85C \uAC31\uC2E0\uB429\uB2C8\uB2E4.')
+  RoleMouse = [regex]::Unescape('\uB9C8\uC6B0\uC2A4')
+  RoleKeyboard = [regex]::Unescape('\uD0A4\uBCF4\uB4DC')
+  Waiting = [regex]::Unescape('\uC544\uC9C1 \uC785\uB825 \uC5C6\uC74C - \uC6C0\uC9C1\uC774\uAC70\uB098 \uB20C\uB7EC \uC8FC\uC138\uC694')
+  Gone = [regex]::Unescape('\uBD84\uB9AC\uB428 - \uB2E4\uB978 \uD3EC\uD2B8\uC5D0 \uAF42\uACE0 \uB2E4\uC2DC \uC6C0\uC9C1\uC774\uAC70\uB098 \uB20C\uB7EC \uC8FC\uC138\uC694')
+  KindCpu = [regex]::Unescape('CPU \uC9C1\uACB0 \uCEE8\uD2B8\uB864\uB7EC')
+  KindPch = [regex]::Unescape('\uBA54\uC778 \uCEE8\uD2B8\uB864\uB7EC (\uC778\uD154 \uCE69\uC14B)')
+  KindChipset = [regex]::Unescape('\uCE69\uC14B \uCEE8\uD2B8\uB864\uB7EC')
+  KindAddon = [regex]::Unescape('\uCD94\uAC00 \uCE69 \uCEE8\uD2B8\uB864\uB7EC')
+  KindUnknown = [regex]::Unescape('\uC54C \uC218 \uC5C6\uB294 \uCEE8\uD2B8\uB864\uB7EC')
+  Ok = [regex]::Unescape('OK - \uC774 PC\uC5D0\uC11C \uAC00\uC7A5 \uC88B\uC740 \uCEE8\uD2B8\uB864\uB7EC\uC5D0 \uC9C1\uC811 \uAF42\uD600 \uC788\uC2B5\uB2C8\uB2E4')
+  MoveToCpu = [regex]::Unescape('CPU \uCEE8\uD2B8\uB864\uB7EC \uD3EC\uD2B8\uB85C \uC62E\uAE30\uC138\uC694 (\uBCF4\uD1B5 \uB4B7\uBA74 \uD3EC\uD2B8 \uC911 \uC77C\uBD80)')
+  AddonMove = [regex]::Unescape('\uCD94\uAC00 \uCE69 \uCEE8\uD2B8\uB864\uB7EC\uC785\uB2C8\uB2E4 - \uB2E4\uB978 \uB4B7\uBA74 \uD3EC\uD2B8\uB85C \uC62E\uAE30\uC138\uC694')
+  HubWarn = [regex]::Unescape('\uD5C8\uBE0C\uB97C \uAC70\uCE69\uB2C8\uB2E4 ({0}) - \uC55E\uBA74/\uBAA8\uB2C8\uD130/\uD0A4\uBCF4\uB4DC \uD3EC\uD2B8 \uB9D0\uACE0 \uB4B7\uBA74 \uD3EC\uD2B8\uC5D0 \uC9C1\uC811 \uAF42\uC73C\uC138\uC694')
+  Bluetooth = [regex]::Unescape('\uBE14\uB8E8\uD22C\uC2A4 \uC5F0\uACB0\uC785\uB2C8\uB2E4 - \uC9C0\uC5F0\uC774 \uD07D\uB2C8\uB2E4. 2.4GHz \uB3D9\uAE00\uC774\uB098 \uC720\uC120\uC73C\uB85C \uC5F0\uACB0\uD558\uC138\uC694')
+  NotUsb = [regex]::Unescape('USB \uC7A5\uCE58\uAC00 \uC544\uB2D9\uB2C8\uB2E4 ({0})')
+  AudioShare = [regex]::Unescape('USB \uC624\uB514\uC624({0})\uAC00 \uB9C8\uC6B0\uC2A4/\uD0A4\uBCF4\uB4DC\uC640 \uAC19\uC740 \uCEE8\uD2B8\uB864\uB7EC\uC5D0 \uC788\uC2B5\uB2C8\uB2E4 - \uC624\uB514\uC624\uB97C \uB2E4\uB978 \uCEE8\uD2B8\uB864\uB7EC \uD3EC\uD2B8\uB85C \uC62E\uAE30\uC138\uC694')
+  Controllers = [regex]::Unescape('USB \uCEE8\uD2B8\uB864\uB7EC \uBAA9\uB85D')
+  NoDevices = [regex]::Unescape('(\uC5F0\uACB0\uB41C \uC7A5\uCE58 \uC5C6\uC74C)')
+  BusLine = [regex]::Unescape('\uBC84\uC2A4 {0} \uC7A5\uCE58 {1} \uAE30\uB2A5 {2}')
+  Close = [regex]::Unescape('\uB2EB\uAE30')
+  HintApply = [regex]::Unescape('\uBE68\uAC15/\uB178\uB791 \uC7A5\uCE58\uB97C \uC62E\uACA8 \uAF42\uACE0(\uCD08\uB85D\uC774 \uB420 \uB54C\uAE4C\uC9C0) \uC774 \uCC3D\uC744 \uB2EB\uC73C\uBA74 \uC801\uC6A9\uC744 \uACC4\uC18D\uD569\uB2C8\uB2E4.')
+}
+
+# W-USB1 - which USB host controller the mouse and keyboard sit on (live window).
+# Windows PowerShell 5.1, ASCII only, read-only towards the system: every native call
+# here is a query (cfgmgr32 devnode walk, raw input device enumeration). No writes.
+
+$script:PcbUsbCs = @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public static class PcbUsbNative
+{
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Locate_DevNodeW(out uint pdnDevInst, string pDeviceID, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll")]
+    static extern uint CM_Get_Parent(out uint pdnDevInst, uint dnDevInst, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Get_Device_IDW(uint dnDevInst, StringBuilder Buffer, int BufferLen, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Get_DevNode_Registry_PropertyW(uint dnDevInst, uint ulProperty,
+        out uint pulRegDataType, byte[] Buffer, ref uint pulLength, uint ulFlags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DEVPROPKEY
+    {
+        public Guid fmtid;
+        public uint pid;
+    }
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Get_DevNode_PropertyW(uint dnDevInst, ref DEVPROPKEY PropertyKey,
+        out uint PropertyType, byte[] PropertyBuffer, ref uint PropertyBufferSize, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Get_Device_ID_List_SizeW(out uint pulLen, string pszFilter, uint ulFlags);
+
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern uint CM_Get_Device_ID_ListW(string pszFilter, [Out] char[] Buffer, uint BufferLen, uint ulFlags);
+
+    const uint DEVICEDESC = 0x1;
+    const uint SERVICE = 0x5;
+    const uint CLASS = 0x8;
+    const uint FRIENDLYNAME = 0xD;
+    const uint BUSNUMBER = 0x16;
+    const uint ADDRESS = 0x1D;
+    const uint FILTER_PRESENT = 0x100;
+
+    static string DeviceId(uint dev)
+    {
+        StringBuilder sb = new StringBuilder(1024);
+        if (CM_Get_Device_IDW(dev, sb, sb.Capacity, 0) != 0) return "";
+        return sb.ToString();
+    }
+
+    static byte[] RegBlob(uint dev, uint prop, out uint type, out uint got)
+    {
+        uint len = 0;
+        type = 0;
+        got = 0;
+        CM_Get_DevNode_Registry_PropertyW(dev, prop, out type, null, ref len, 0);
+        if (len == 0) return null;
+        byte[] buf = new byte[len];
+        if (CM_Get_DevNode_Registry_PropertyW(dev, prop, out type, buf, ref len, 0) != 0) return null;
+        got = len;
+        return buf;
+    }
+
+    static string RegStr(uint dev, uint prop)
+    {
+        uint type, got;
+        byte[] buf = RegBlob(dev, prop, out type, out got);
+        if (buf == null) return "";
+        int n = (int)Math.Min(got, (uint)buf.Length);
+        string s = Encoding.Unicode.GetString(buf, 0, n);
+        int z = s.IndexOf('\0');
+        if (z >= 0) s = s.Substring(0, z);
+        return s.Trim();
+    }
+
+    // DEVPKEY_Device_BusReportedDeviceDesc {540b947e-8b40-45bc-a8a2-6a0b894cbda2} pid 4.
+    // This is the product string the device reports over the bus (e.g. "RE:AL IX"), which the
+    // friendly name on a composite parent does not carry.
+    static readonly Guid BUSREPORTED_FMTID = new Guid("540b947e-8b40-45bc-a8a2-6a0b894cbda2");
+    const uint BUSREPORTED_PID = 4;
+    const uint DEVPROP_TYPE_STRING = 0x12;
+    const uint CR_BUFFER_SMALL = 0x1A;
+
+    static string BusStr(uint dev)
+    {
+        DEVPROPKEY key = new DEVPROPKEY();
+        key.fmtid = BUSREPORTED_FMTID;
+        key.pid = BUSREPORTED_PID;
+        uint type = 0;
+        uint len = 0;
+        uint r = CM_Get_DevNode_PropertyW(dev, ref key, out type, null, ref len, 0);
+        if (r != CR_BUFFER_SMALL || len < 2 || len > 65536) return "";
+        byte[] buf = new byte[len];
+        r = CM_Get_DevNode_PropertyW(dev, ref key, out type, buf, ref len, 0);
+        if (r != 0 || type != DEVPROP_TYPE_STRING) return "";
+        int n = (int)Math.Min(len, (uint)buf.Length);
+        if (n <= 0) return "";
+        string s = Encoding.Unicode.GetString(buf, 0, n);
+        int z = s.IndexOf('\0');
+        if (z >= 0) s = s.Substring(0, z);
+        return s.Trim();
+    }
+
+    public static string[] PresentIds()
+    {
+        uint len = 0;
+        if (CM_Get_Device_ID_List_SizeW(out len, null, FILTER_PRESENT) != 0 || len == 0) return new string[0];
+        char[] buf = new char[len];
+        if (CM_Get_Device_ID_ListW(null, buf, len, FILTER_PRESENT) != 0) return new string[0];
+        string all = new string(buf);
+        List<string> res = new List<string>();
+        foreach (string p in all.Split('\0'))
+        {
+            if (p != null && p.Length > 0) res.Add(p);
+        }
+        return res.ToArray();
+    }
+
+    public static object[] Node(string id)
+    {
+        if (String.IsNullOrEmpty(id)) return null;
+        uint dev;
+        if (CM_Locate_DevNodeW(out dev, id, 0) != 0) return null;
+        string canon = DeviceId(dev);
+        string parent = "";
+        uint pdev;
+        if (CM_Get_Parent(out pdev, dev, 0) == 0) parent = DeviceId(pdev);
+        string svc = RegStr(dev, SERVICE);
+        string cls = RegStr(dev, CLASS);
+        string name = RegStr(dev, FRIENDLYNAME);
+        if (name.Length == 0) name = RegStr(dev, DEVICEDESC);
+        int bus = -1;
+        long addr = -1;
+        uint type, got;
+        byte[] bb = RegBlob(dev, BUSNUMBER, out type, out got);
+        if (bb != null && got >= 4 && type == 4) bus = BitConverter.ToInt32(bb, 0);
+        byte[] ab = RegBlob(dev, ADDRESS, out type, out got);
+        if (ab != null && got >= 4 && type == 4) addr = (long)BitConverter.ToUInt32(ab, 0);
+        return new object[] {
+            canon.Length > 0 ? canon : id, parent, svc, cls, name,
+            (object)bus, (object)addr, BusStr(dev)
+        };
+    }
+}
+
+public class PcbUsbForm : Form
+{
+    const uint RID_INPUT = 0x10000003;
+    const uint RID_HEADER = 0x10000005;
+    const uint RIDI_DEVICENAME = 0x20000007;
+    const uint RIDEV_INPUTSINK = 0x00000100;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICE
+    {
+        public ushort UsagePage;
+        public ushort Usage;
+        public uint Flags;
+        public IntPtr Target;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTHEADER
+    {
+        public uint Type;
+        public uint Size;
+        public IntPtr Device;
+        public IntPtr WParam;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RAWINPUTDEVICELIST
+    {
+        public IntPtr Device;
+        public uint Type;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool RegisterRawInputDevices(RAWINPUTDEVICE[] pRawInputDevices, uint uiNumDevices, uint cbSize);
+
+    [DllImport("user32.dll")]
+    static extern uint GetRawInputData(IntPtr hRawInput, uint uiCommand, IntPtr pData, ref uint pcbSize, uint cbSizeHeader);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern uint GetRawInputDeviceInfoW(IntPtr hDevice, uint uiCommand, IntPtr pData, ref uint pcbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern uint GetRawInputDeviceList(IntPtr pRawInputDeviceList, ref uint puiNumDevices, uint cbSize);
+
+    public static string LastMouse = "";
+    public static string LastKeyboard = "";
+    public static int MouseSeq = 0;
+    public static int KeyboardSeq = 0;
+
+    public bool RegisterOk = false;
+    public int RegisterError = 0;
+    public bool NoActivate = false;
+
+    Dictionary<IntPtr, string> nameCache = new Dictionary<IntPtr, string>();
+    IntPtr hdrBuf;
+    uint hdrSize;
+
+    public PcbUsbForm()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        hdrBuf = Marshal.AllocHGlobal(64);
+        hdrSize = (uint)Marshal.SizeOf(typeof(RAWINPUTHEADER));
+    }
+
+    protected override bool ShowWithoutActivation
+    {
+        get { return NoActivate; }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (hdrBuf != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(hdrBuf);
+            hdrBuf = IntPtr.Zero;
+        }
+        base.Dispose(disposing);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        RAWINPUTDEVICE[] devs = new RAWINPUTDEVICE[2];
+        devs[0].UsagePage = 1;
+        devs[0].Usage = 2;
+        devs[0].Flags = RIDEV_INPUTSINK;
+        devs[0].Target = this.Handle;
+        devs[1].UsagePage = 1;
+        devs[1].Usage = 6;
+        devs[1].Flags = RIDEV_INPUTSINK;
+        devs[1].Target = this.Handle;
+        RegisterOk = RegisterRawInputDevices(devs, 2, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE)));
+        if (!RegisterOk) RegisterError = Marshal.GetLastWin32Error();
+    }
+
+    string NameOf(IntPtr dev)
+    {
+        string s;
+        if (nameCache.TryGetValue(dev, out s)) return s;
+        uint size = 0;
+        s = "";
+        if (GetRawInputDeviceInfoW(dev, RIDI_DEVICENAME, IntPtr.Zero, ref size) != unchecked((uint)-1) && size > 0)
+        {
+            IntPtr buf = Marshal.AllocHGlobal((int)size * 2);
+            try
+            {
+                uint sz = size;
+                uint r = GetRawInputDeviceInfoW(dev, RIDI_DEVICENAME, buf, ref sz);
+                if (r != unchecked((uint)-1) && r != 0) s = Marshal.PtrToStringUni(buf);
+                if (s == null) s = "";
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+        nameCache[dev] = s;
+        return s;
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x00FF)
+        {
+            uint size = hdrSize;
+            uint r = GetRawInputData(m.LParam, RID_HEADER, hdrBuf, ref size, hdrSize);
+            if (r == size && size >= hdrSize)
+            {
+                RAWINPUTHEADER h = (RAWINPUTHEADER)Marshal.PtrToStructure(hdrBuf, typeof(RAWINPUTHEADER));
+                if (h.Device != IntPtr.Zero)
+                {
+                    string nm = NameOf(h.Device);
+                    if (nm.Length > 0)
+                    {
+                        if (h.Type == 0) { LastMouse = nm; MouseSeq++; }
+                        else if (h.Type == 1) { LastKeyboard = nm; KeyboardSeq++; }
+                    }
+                }
+            }
+        }
+        base.WndProc(ref m);
+    }
+
+    public static string ToInstanceId(string rawName)
+    {
+        if (rawName == null) return "";
+        string s = rawName;
+        if (s.StartsWith(@"\\?\")) s = s.Substring(4);
+        int i = s.LastIndexOf("#{");
+        if (i >= 0) s = s.Substring(0, i);
+        else
+        {
+            int j = s.LastIndexOf('#');
+            if (j >= 0) s = s.Substring(0, j);
+        }
+        return s.Replace('#', '\\');
+    }
+
+    public static string[] ListNames()
+    {
+        uint count = 0;
+        uint elem = (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICELIST));
+        if (GetRawInputDeviceList(IntPtr.Zero, ref count, elem) != 0 || count == 0) return new string[0];
+        IntPtr arr = Marshal.AllocHGlobal((int)(count * elem));
+        try
+        {
+            uint n = count;
+            if (GetRawInputDeviceList(arr, ref n, elem) == unchecked((uint)-1)) return new string[0];
+            List<string> res = new List<string>();
+            for (int k = 0; k < n; k++)
+            {
+                IntPtr p = new IntPtr(arr.ToInt64() + (long)k * elem);
+                RAWINPUTDEVICELIST it = (RAWINPUTDEVICELIST)Marshal.PtrToStructure(p, typeof(RAWINPUTDEVICELIST));
+                string nm = NameOfStatic(it.Device);
+                if (nm.Length > 0) res.Add(nm);
+            }
+            return res.ToArray();
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(arr);
+        }
+    }
+
+    static string NameOfStatic(IntPtr dev)
+    {
+        uint size = 0;
+        if (GetRawInputDeviceInfoW(dev, RIDI_DEVICENAME, IntPtr.Zero, ref size) != unchecked((uint)-1) && size > 0)
+        {
+            IntPtr buf = Marshal.AllocHGlobal((int)size * 2);
+            try
+            {
+                uint sz = size;
+                uint r = GetRawInputDeviceInfoW(dev, RIDI_DEVICENAME, buf, ref sz);
+                if (r != unchecked((uint)-1) && r != 0) return Marshal.PtrToStringUni(buf) ?? "";
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+            }
+        }
+        return "";
+    }
+}
+'@
+
+$script:PcbUsbNativeReady = $false
+
+function Initialize-PcbUsbNative {
+  if (-not ('PcbUsbNative' -as [type])) {
+    Add-Type -TypeDefinition $script:PcbUsbCs -ReferencedAssemblies System.Windows.Forms, System.Drawing -ErrorAction Stop
+  }
+  $script:PcbUsbNativeReady = $true
+  return $true
+}
+
+# --- seams: the only way the logic below reads the device tree ---------------
+$script:PcbUsbTree = { param([string]$Id)
+  if (-not $script:PcbUsbNativeReady) { Initialize-PcbUsbNative | Out-Null }
+  $o = [PcbUsbNative]::Node($Id); if ($null -eq $o) { return $null }
+  return @{ Id = [string]$o[0]; Parent = [string]$o[1]; Service = [string]$o[2]; Class = [string]$o[3]; Name = [string]$o[4]; Bus = [int]$o[5]; Addr = [int64]$o[6]; BusName = [string]$o[7] } }
+$script:PcbUsbList = {
+  if (-not $script:PcbUsbNativeReady) { Initialize-PcbUsbNative | Out-Null }
+  return @([PcbUsbNative]::PresentIds()) }
+
+$script:PcbUsbRank = @{ cpu = 3; pch = 3; chipset = 1; addon = 0; unknown = 0 }
+
+function Get-PcbUsbKind([hashtable]$Ctl) {
+  $m = [regex]::Match([string]$Ctl.Id, '^PCI\\VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})')
+  if (-not $m.Success) { return 'unknown' }
+  $ven = $m.Groups[1].Value.ToUpperInvariant()
+  if ($ven -eq '1022') {
+    $p = & $script:PcbUsbTree ([string]$Ctl.Parent)
+    if ($null -ne $p -and ([string]$p.Id) -like 'PCI\*' -and $p.Bus -eq 0 -and (@(7, 8) -contains [int](([int64]$p.Addr) -shr 16))) { return 'cpu' }
+    return 'chipset'
+  }
+  if ($ven -eq '8086') {
+    $dev = [int](([int64]$Ctl.Addr) -shr 16)
+    if ($Ctl.Bus -eq 0 -and $dev -eq 13) { return 'cpu' }
+    if ($Ctl.Bus -eq 0 -and $dev -eq 20) { return 'pch' }
+    return 'addon'
+  }
+  return 'addon'
+}
+
+function Get-PcbUsbPath([string]$Id) {
+  $r = @{ Id = $Id; Present = $false; Bluetooth = $false; Controller = $null; RootHub = $null; Hubs = @(); Top = $null; Chain = @() }
+  $n = & $script:PcbUsbTree $Id
+  if ($null -eq $n) { return $r }
+  $r.Present = $true
+  if ($Id -match '^HID\\\{0000(1124|1812)-') { $r.Bluetooth = $true }
+  $prev = $null
+  for ($i = 0; $i -lt 32 -and $null -ne $n; $i++) {
+    $nid = [string]$n.Id
+    $r.Chain += $nid
+    if ($nid -match '^(BTHENUM|BTHLEDEVICE|BTHLE)\\') { $r.Bluetooth = $true }
+    if ($nid -like 'USB\ROOT_HUB*') { $r.RootHub = $n; if ($null -eq $r.Top) { $r.Top = $prev } }
+    elseif ($nid -like 'USB\*' -and ([string]$n.Service) -match '^usbhub3?$') { $r.Hubs += $n; if ($null -eq $r.Top) { $r.Top = $prev } }
+    if ($nid -like 'PCI\*' -and ([string]$n.Class) -eq 'USB') { $r.Controller = $n; break }
+    $prev = $n
+    if ([string]::IsNullOrEmpty([string]$n.Parent)) { break }
+    $n = & $script:PcbUsbTree ([string]$n.Parent)
+  }
+  return $r
+}
+
+function Get-PcbUsbVerdict([string]$Id, [object[]]$Controllers) {
+  $p = Get-PcbUsbPath $Id
+  if (-not $p.Present) { return @{ Level = 'none'; Text = $script:PcbUsbS.Gone; Path = $p; Kind = '' } }
+  if ($p.Bluetooth) { return @{ Level = 'bad'; Text = $script:PcbUsbS.Bluetooth; Path = $p; Kind = '' } }
+  if ($null -eq $p.Controller) { return @{ Level = 'none'; Text = ($script:PcbUsbS.NotUsb -f $Id); Path = $p; Kind = '' } }
+  $kind = Get-PcbUsbKind $p.Controller
+  $best = 0
+  foreach ($c in @($Controllers)) { $k = $script:PcbUsbRank[(Get-PcbUsbKind $c)]; if ($k -gt $best) { $best = $k } }
+  if ($script:PcbUsbRank[$kind] -lt $best) {
+    if ($kind -eq 'addon') { return @{ Level = 'bad'; Text = $script:PcbUsbS.AddonMove; Path = $p; Kind = $kind } }
+    return @{ Level = 'bad'; Text = $script:PcbUsbS.MoveToCpu; Path = $p; Kind = $kind }
+  }
+  if (@($p.Hubs).Count -gt 0) { return @{ Level = 'warn'; Text = ($script:PcbUsbS.HubWarn -f (Get-PcbUsbName $p.Hubs[0])); Path = $p; Kind = $kind } }
+  return @{ Level = 'ok'; Text = $script:PcbUsbS.Ok; Path = $p; Kind = $kind }
+}
+
+function Get-PcbUsbName($n) {
+  if ($null -eq $n) { return '?' }
+  $s = [string]$n.Name
+  if (($n -is [hashtable]) -and $n.ContainsKey('BusName')) { $b = [string]$n.BusName; if ($b -ne '') { $s = $b } }
+  if ($s -eq '') { $s = [string]$n.Id }
+  $m = [regex]::Match([string]$n.Id, 'VID_(\w{4})&PID_(\w{4})')
+  if ($m.Success) { $s = $s + ' (' + $m.Groups[1].Value.ToUpperInvariant() + ':' + $m.Groups[2].Value.ToUpperInvariant() + ')' }
+  return $s
+}
+
+function Get-PcbUsbControllers {
+  $out = @()
+  foreach ($id in @(& $script:PcbUsbList)) {
+    if (-not ([string]$id -like 'PCI\*')) { continue }
+    $n = & $script:PcbUsbTree ([string]$id)
+    if ($null -eq $n) { continue }
+    if (-not ([string]$n.Class -eq 'USB')) { continue }
+    $out += @{ Node = $n; Id = [string]$n.Id }
+  }
+  return $out
+}
+
+function Get-PcbUsbAudioWarn([object[]]$Paths, [object[]]$Controllers, [string[]]$AllIds) {
+  $out = @()
+  if (@($Controllers).Count -lt 2) { return $out }
+  $ctlIds = @()
+  foreach ($p in @($Paths)) {
+    if ($null -ne $p -and $p.Present -and (-not $p.Bluetooth) -and $null -ne $p.Controller) { $ctlIds += [string]$p.Controller.Id }
+  }
+  if (@($ctlIds).Count -eq 0) { return $out }
+  foreach ($id in @($AllIds)) {
+    $sid = [string]$id
+    if (-not ($sid -like 'USB\*')) { continue }
+    $n = & $script:PcbUsbTree $sid
+    if ($null -eq $n) { continue }
+    if (-not (([string]$n.Class -eq 'MEDIA') -or ([string]$n.Service -match '^usbaudio'))) { continue }
+    $ap = Get-PcbUsbPath $sid
+    if ($null -eq $ap.Controller) { continue }
+    if (@($ctlIds) -contains [string]$ap.Controller.Id) {
+      $line = $script:PcbUsbS.AudioShare -f (Get-PcbUsbName $ap.Top)
+      if (@($out) -notcontains $line) { $out += $line }
+    }
+  }
+  return $out
+}
+
+function Get-PcbUsbKindLabel([string]$Kind) {
+  switch ([string]$Kind) {
+    'cpu' { return $script:PcbUsbS.KindCpu }
+    'pch' { return $script:PcbUsbS.KindPch }
+    'chipset' { return $script:PcbUsbS.KindChipset }
+    'addon' { return $script:PcbUsbS.KindAddon }
+    default { return $script:PcbUsbS.KindUnknown }
+  }
+}
+
+function Get-PcbUsbSnapshot([string]$MouseId, [string]$KeyboardId) {
+  $ctls = @(Get-PcbUsbControllers)
+  $nodes = @($ctls | ForEach-Object { $_.Node })
+  $all = @(& $script:PcbUsbList)
+  $mv = @{ Level = 'none'; Text = $script:PcbUsbS.Waiting; Path = $null; Kind = '' }
+  if ([string]$MouseId -ne '') { $mv = Get-PcbUsbVerdict $MouseId $nodes }
+  $kv = @{ Level = 'none'; Text = $script:PcbUsbS.Waiting; Path = $null; Kind = '' }
+  if ([string]$KeyboardId -ne '') { $kv = Get-PcbUsbVerdict $KeyboardId $nodes }
+  $paths = @()
+  if ($null -ne $mv.Path -and $mv.Path.Present -and (-not $mv.Path.Bluetooth)) { $paths += $mv.Path }
+  if ($null -ne $kv.Path -and $kv.Path.Present -and (-not $kv.Path.Bluetooth)) { $paths += $kv.Path }
+  $audio = @(Get-PcbUsbAudioWarn $paths $nodes $all)
+  $rows = @()
+  foreach ($c in $ctls) {
+    $n = $c.Node
+    $k = Get-PcbUsbKind $n
+    $ven = ''
+    $m = [regex]::Match([string]$n.Id, 'VEN_([0-9A-Fa-f]{4})&DEV_([0-9A-Fa-f]{4})')
+    if ($m.Success) { $ven = ($m.Groups[1].Value + ':' + $m.Groups[2].Value).ToUpperInvariant() }
+    $addr = [int64]$n.Addr
+    $bdev = -1
+    $bfn = -1
+    if ($addr -ge 0) { $bdev = [int](($addr -shr 16) -band 0xFFFF); $bfn = [int]($addr -band 0xFFFF) }
+    $devs = @()
+    foreach ($id in $all) {
+      $sid = [string]$id
+      if (-not ($sid -like 'USB\VID_*')) { continue }
+      if ($sid -like '*&MI_*') { continue }
+      $dp = Get-PcbUsbPath $sid
+      if ($null -eq $dp.Controller) { continue }
+      if (-not ([string]$dp.Controller.Id -eq [string]$n.Id)) { continue }
+      $dn = & $script:PcbUsbTree $sid
+      if ($null -eq $dn) { continue }
+      $par = & $script:PcbUsbTree ([string]$dn.Parent)
+      $direct = ($null -ne $par) -and (([string]$par.Id -like 'USB\ROOT_HUB*') -or ([string]$par.Service -match '^usbhub3?$'))
+      if (-not $direct) { continue }
+      $label = Get-PcbUsbName $dn
+      if ($null -ne $dn -and ([string]$dn.Service) -match '^usbhub3?$') { $label = $label + ' [hub]' }
+      $devs += $label
+    }
+    $rows += @{ Node = $n; Kind = $k; Label = (Get-PcbUsbKindLabel $k); VenDev = $ven; Bus = $bdev; Dev = $bdev; Func = $bfn; BusLine = ($script:PcbUsbS.BusLine -f $n.Bus, $bdev, $bfn); Devices = $devs }
+  }
+  return @{ Controllers = $rows; Mouse = $mv; Keyboard = $kv; Audio = $audio; Ids = $all }
+}
+
+# One row per physical USB input device: a top USB device with a Mouse- or Keyboard-class collection and no audio
+# function (a headset's volume keys are not the keyboard).  Bluetooth inputs get one row per BT device; inputs
+# that are not USB at all (PS/2, remote desktop) get none.
+function Get-PcbUsbInputCheck {
+  $ids = @(& $script:PcbUsbList)
+  $ctls = @(Get-PcbUsbControllers | ForEach-Object { $_.Node })
+  $tops = @{}
+  $media = @{}
+  foreach ($id in $ids) {
+    $n = & $script:PcbUsbTree ([string]$id)
+    if ($null -eq $n) { continue }
+    $cls = [string]$n.Class
+    $isAudio = ([string]$id -like 'USB\*') -and (($cls -eq 'MEDIA') -or ([string]$n.Service -match '^usbaudio'))
+    if ($cls -ne 'Mouse' -and $cls -ne 'Keyboard' -and -not $isAudio) { continue }
+    $p = Get-PcbUsbPath ([string]$id)
+    if ($isAudio) { if ($null -ne $p.Top) { $media[[string]$p.Top.Id] = $true }; continue }
+    $k = ''
+    if ($p.Bluetooth) {
+      $bt = @($p.Chain | Where-Object { $_ -match '^(BTHENUM|BTHLEDEVICE)\\' } | Select-Object -First 1)
+      if ($bt.Count -gt 0) { $k = 'BT:' + [string]$bt[0] } else { $k = 'BT:' + [string]$id }
+    } elseif ($null -ne $p.Top) {
+      $k = [string]$p.Top.Id
+    } else {
+      continue
+    }
+    if (-not $tops.ContainsKey($k)) { $tops[$k] = @{ Id = [string]$id; Role = $cls; Path = $p } }
+    elseif ([string]$tops[$k].Role -ne $cls) { $tops[$k].Role = 'Mouse+Keyboard' }
+  }
+  $rows = @()
+  foreach ($k in @($tops.Keys | Sort-Object)) {
+    if ($media.ContainsKey($k)) { continue }
+    $t = $tops[$k]
+    $v = Get-PcbUsbVerdict ([string]$t.Id) $ctls
+    if ($t.Path.Bluetooth) {
+      $nm = 'Bluetooth ' + (Get-PcbUsbName (& $script:PcbUsbTree $k.Substring(3)))
+    } else {
+      $nm = Get-PcbUsbName $t.Path.Top
+    }
+    $rows += @{ Name = $nm; Role = [string]$t.Role; Level = [string]$v.Level; Kind = [string]$v.Kind; Text = [string]$v.Text }
+  }
+  return $rows
+}
+
+function Set-PcbUsbRoleLabel($Ui, [string]$Role, $Verdict) {
+  $nameBox = $Ui.NameBox[$Role]
+  $kindBox = $Ui.KindBox[$Role]
+  $busBox = $Ui.BusBox[$Role]
+  $verdictBox = $Ui.VerdictBox[$Role]
+  $panel = $Ui.PanelBox[$Role]
+  $topName = $Ui.IdText[$Role]
+  $kindText = ''
+  $busText = ''
+  if ($null -ne $Verdict.Path -and $null -ne $Verdict.Path.Top) { $topName = Get-PcbUsbName $Verdict.Path.Top }
+  elseif ($null -ne $Verdict.Path -and (-not $Verdict.Path.Present)) { $topName = $Ui.IdText[$Role] }
+  if ($null -ne $Verdict.Path -and $null -ne $Verdict.Path.Controller) {
+    $cid = [string]$Verdict.Path.Controller.Id
+    foreach ($r in @($Ui.Snap.Controllers)) {
+      if ([string]$r.Node.Id -eq $cid) {
+        $kindText = $r.Label
+        $busText = $r.BusLine + '  ' + $r.VenDev
+        $topName = Get-PcbUsbName $Verdict.Path.Top
+        break
+      }
+    }
+  }
+  if ($null -eq $topName -or $topName -eq '') { $topName = '-' }
+  $nameBox.Text = $topName
+  $kindBox.Text = $kindText
+  $busBox.Text = $busText
+  $verdictBox.Text = [string]$Verdict.Text
+  switch ([string]$Verdict.Level) {
+    'ok' { $panel.BackColor = [System.Drawing.Color]::FromArgb(200, 247, 197) }
+    'warn' { $panel.BackColor = [System.Drawing.Color]::FromArgb(255, 240, 170) }
+    'bad' { $panel.BackColor = [System.Drawing.Color]::FromArgb(255, 200, 200) }
+    default { $panel.BackColor = [System.Drawing.Color]::FromArgb(225, 225, 225) }
+  }
+}
+
+function Update-PcbUsbUi {
+  $u = $script:PcbUsbUi
+  if ($null -eq $u) { return }
+  $u.IdText['mouse'] = [string]$u.MouseId
+  $u.IdText['keyboard'] = [string]$u.KeyboardId
+  $snap = Get-PcbUsbSnapshot ([string]$u.MouseId) ([string]$u.KeyboardId)
+  $u.Snap = $snap
+  Set-PcbUsbRoleLabel $u 'mouse' $snap.Mouse
+  Set-PcbUsbRoleLabel $u 'keyboard' $snap.Keyboard
+  $u.AudioBox.Text = (@($snap.Audio) -join [Environment]::NewLine)
+  $lines = @()
+  $lines += $script:PcbUsbS.Controllers
+  $i = 0
+  foreach ($r in @($snap.Controllers)) {
+    $i++
+    $lines += ('[' + $i + '] ' + $r.Label + '  ' + $r.VenDev + '  ' + $r.BusLine)
+    if (@($r.Devices).Count -eq 0) { $lines += ('    ' + $script:PcbUsbS.NoDevices) }
+    foreach ($d in @($r.Devices)) { $lines += ('    ' + $d) }
+  }
+  $u.ListBox.Text = ($lines -join [Environment]::NewLine)
+}
+
+function Show-PcbUsbScan {
+  param(
+    [int]$AutoCloseSec = 0,
+    [string]$ShotPath = '',
+    [switch]$TestMode,
+    [string]$FakeMouse = '',
+    [string]$FakeKeyboard = '',
+    [string]$Hint = ''
+  )
+  Add-Type -AssemblyName System.Windows.Forms | Out-Null
+  Add-Type -AssemblyName System.Drawing | Out-Null
+  Initialize-PcbUsbNative | Out-Null
+
+  if ($FakeMouse -ne '') { [PcbUsbForm]::LastMouse = $FakeMouse }
+  if ($FakeKeyboard -ne '') { [PcbUsbForm]::LastKeyboard = $FakeKeyboard }
+
+  $f = New-Object PcbUsbForm
+  $form = $f
+  $form.Text = $script:PcbUsbS.Title
+  $form.Font = New-Object System.Drawing.Font('Malgun Gothic', 11)
+  $form.ClientSize = New-Object System.Drawing.Size(780, 620)
+  $form.TopMost = $true
+  $form.NoActivate = [bool]$TestMode
+  if ($TestMode) {
+    $form.ShowInTaskbar = $false
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $form.Location = New-Object System.Drawing.Point(-3000, -3000)
+  }
+
+  # the label local cannot be called $hint: PowerShell variables are case-insensitive and
+  # that is the -Hint parameter itself.
+  $hintLabel = New-Object System.Windows.Forms.Label
+  $hintLabel.Text = $script:PcbUsbS.Hint
+  if ($Hint -ne '') { $hintLabel.Text = $Hint }
+  $hintLabel.Location = New-Object System.Drawing.Point(12, 10)
+  $hintLabel.Size = New-Object System.Drawing.Size(756, 30)
+  $form.Controls.Add($hintLabel)
+
+  $ui = @{
+    PanelBox = @{}
+    NameBox = @{}
+    KindBox = @{}
+    BusBox = @{}
+    VerdictBox = @{}
+    IdText = @{ mouse = ''; keyboard = '' }
+    MouseId = ''
+    KeyboardId = ''
+    Snap = $null
+    LastSnap = [DateTime]::MinValue
+    Shot = ''
+    ShotDone = $false
+    Measure = @()
+  }
+
+  $roles = @(
+    @{ Key = 'mouse'; Title = $script:PcbUsbS.RoleMouse; X = 12 },
+    @{ Key = 'keyboard'; Title = $script:PcbUsbS.RoleKeyboard; X = 398 }
+  )
+  foreach ($r in $roles) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Location = New-Object System.Drawing.Point($r.X, 44)
+    $p.Size = New-Object System.Drawing.Size(370, 214)
+    $p.BackColor = [System.Drawing.Color]::FromArgb(225, 225, 225)
+    $p.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $t = New-Object System.Windows.Forms.Label
+    $t.Text = $r.Title
+    $t.Location = New-Object System.Drawing.Point(10, 6)
+    $t.Size = New-Object System.Drawing.Size(340, 26)
+    $t.Font = New-Object System.Drawing.Font('Malgun Gothic', 13, [System.Drawing.FontStyle]::Bold)
+    $p.Controls.Add($t)
+    $nb = New-Object System.Windows.Forms.Label
+    $nb.Location = New-Object System.Drawing.Point(10, 36)
+    $nb.Size = New-Object System.Drawing.Size(350, 24)
+    $nb.AutoEllipsis = $true
+    $p.Controls.Add($nb)
+    $kb = New-Object System.Windows.Forms.Label
+    $kb.Location = New-Object System.Drawing.Point(10, 62)
+    $kb.Size = New-Object System.Drawing.Size(350, 22)
+    $kb.AutoEllipsis = $true
+    $p.Controls.Add($kb)
+    $bb = New-Object System.Windows.Forms.Label
+    $bb.Location = New-Object System.Drawing.Point(10, 86)
+    $bb.Size = New-Object System.Drawing.Size(350, 22)
+    $bb.AutoEllipsis = $true
+    $p.Controls.Add($bb)
+    $vb = New-Object System.Windows.Forms.Label
+    $vb.Location = New-Object System.Drawing.Point(10, 112)
+    $vb.Size = New-Object System.Drawing.Size(350, 96)
+    $p.Controls.Add($vb)
+    $form.Controls.Add($p)
+    $ui.PanelBox[$r.Key] = $p
+    $ui.NameBox[$r.Key] = $nb
+    $ui.KindBox[$r.Key] = $kb
+    $ui.BusBox[$r.Key] = $bb
+    $ui.VerdictBox[$r.Key] = $vb
+  }
+
+  $audio = New-Object System.Windows.Forms.Label
+  $audio.Location = New-Object System.Drawing.Point(12, 266)
+  $audio.Size = New-Object System.Drawing.Size(756, 54)
+  $audio.ForeColor = [System.Drawing.Color]::FromArgb(150, 0, 0)
+  $form.Controls.Add($audio)
+
+  $list = New-Object System.Windows.Forms.TextBox
+  $list.Location = New-Object System.Drawing.Point(12, 324)
+  $list.Size = New-Object System.Drawing.Size(756, 240)
+  $list.Multiline = $true
+  $list.ReadOnly = $true
+  $list.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+  $list.WordWrap = $false
+  $list.BackColor = [System.Drawing.Color]::White
+  $form.Controls.Add($list)
+
+  $btn = New-Object System.Windows.Forms.Button
+  $btn.Text = $script:PcbUsbS.Close
+  $btn.Location = New-Object System.Drawing.Point(676, 574)
+  $btn.Size = New-Object System.Drawing.Size(92, 34)
+  $btn.Add_Click({ foreach ($ff in [System.Windows.Forms.Application]::OpenForms) { $ff.Close() } })
+  $form.Controls.Add($btn)
+
+  $ui.AudioBox = $audio
+  $ui.ListBox = $list
+  $script:PcbUsbUi = $ui
+
+  $timer = New-Object System.Windows.Forms.Timer
+  $timer.Interval = 500
+  $timer.Add_Tick({
+    $u = $script:PcbUsbUi
+    if ($null -eq $u) { return }
+    try {
+      $mid = [PcbUsbForm]::ToInstanceId([string][PcbUsbForm]::LastMouse)
+      $kid = [PcbUsbForm]::ToInstanceId([string][PcbUsbForm]::LastKeyboard)
+      if ($mid -ne $u.MouseId -or $kid -ne $u.KeyboardId -or ((Get-Date) - $u.LastSnap).TotalSeconds -ge 2) {
+        $u.MouseId = $mid
+        $u.KeyboardId = $kid
+        $u.LastSnap = Get-Date
+        Update-PcbUsbUi
+      }
+    } catch {
+      $u.ListBox.Text = 'ERR ' + $_.Exception.Message
+    }
+  })
+
+  $fullShot = ''
+  if ($ShotPath -ne '') {
+    if ([System.IO.Path]::IsPathRooted($ShotPath)) { $fullShot = $ShotPath }
+    else { $fullShot = Join-Path (Get-Location).Path $ShotPath }
+    $dir = [System.IO.Path]::GetDirectoryName($fullShot)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not [System.IO.Directory]::Exists($dir)) {
+      [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    }
+  }
+
+  $timer.Start()
+  $shotAt = $null
+  if ($fullShot -ne '') { $shotAt = (Get-Date).AddSeconds(1) }
+  $endAt = $null
+  if ($AutoCloseSec -gt 0) { $endAt = (Get-Date).AddSeconds($AutoCloseSec) }
+  try {
+    $form.Show()
+    while ($form.Visible) {
+      [System.Windows.Forms.Application]::DoEvents()
+      if ((@($ui.Measure)).Count -eq 0 -and $null -ne $ui.Snap) {
+        $m = @()
+        foreach ($k in @('mouse', 'keyboard')) {
+          $v = $ui.VerdictBox[$k]
+          $need = [System.Windows.Forms.TextRenderer]::MeasureText($v.Text, $v.Font, (New-Object System.Drawing.Size($v.Width, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak).Height
+          $m += @{ Role = ('verdict:' + $k); Text = [string]$v.Text; Len = ([string]$v.Text).Length; Need = [int]$need; Have = [int]$v.Height; Fit = ($need -le $v.Height) }
+        }
+        $ab = $ui.AudioBox
+        $aneed = [System.Windows.Forms.TextRenderer]::MeasureText($ab.Text, $ab.Font, (New-Object System.Drawing.Size($ab.Width, 0)), [System.Windows.Forms.TextFormatFlags]::WordBreak).Height
+        $m += @{ Role = 'audio'; Text = [string]$ab.Text; Len = ([string]$ab.Text).Length; Need = [int]$aneed; Have = [int]$ab.Height; Fit = ($aneed -le $ab.Height) }
+        $ui.Measure = $m
+      }
+      if ($null -ne $shotAt -and (-not $ui.ShotDone) -and (Get-Date) -ge $shotAt) {
+        $ui.ShotDone = $true
+        try {
+          $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
+          $rect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
+          $form.DrawToBitmap($bmp, $rect)
+          $bmp.Save($fullShot, [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+          $ui.Shot = $fullShot
+        } catch {
+          $ui.Shot = ''
+        }
+      }
+      if ($null -ne $endAt -and (Get-Date) -ge $endAt) { break }
+      Start-Sleep -Milliseconds 25
+    }
+  } finally {
+    $timer.Stop()
+    try { $form.Close() } catch { }
+    $script:PcbUsbUi = $null
+  }
+
+  return @{
+    RegisterOk = [bool]$f.RegisterOk
+    RegisterError = [int]$f.RegisterError
+    MouseSeq = [int][PcbUsbForm]::MouseSeq
+    KeyboardSeq = [int][PcbUsbForm]::KeyboardSeq
+    Shot = [string]$ui.Shot
+    Measure = @($ui.Measure)
+  }
+}
+
+# ==== end usbscan.ps1 ====
+
+# ==== begin gui.ps1 ====
+# W-GUI1 - one window for the whole kit.  Windows PowerShell 5.1, ASCII only.
+# The payload's -Gui mode runs this: one Korean WinForms window whose six buttons start
+# the payload again as a hidden child process (-NoPause) and stream its report into the
+# log box.  Nothing here touches the machine by itself; every change is a child run of
+# the same script, with the same modes the one-liners pass.
+
+$script:PcbGuiS = @{
+  Title = [regex]::Unescape('PC\uBC29 \uB864 \uC9C0\uC5F0 \uCD5C\uC801\uD654')
+  StateNone = [regex]::Unescape('\uD604\uC7AC \uC0C1\uD0DC: \uC801\uC6A9 \uC548 \uB428')
+  StateApplied = [regex]::Unescape('\uD604\uC7AC \uC0C1\uD0DC: \uC801\uC6A9\uB428 - \uC6D0\uBCF5\uD558\uBA74 \uC804\uBD80 \uB418\uB3CC\uC544\uAC11\uB2C8\uB2E4')
+  StateGameOffice = [regex]::Unescape('\uD604\uC7AC \uC0C1\uD0DC: \uAC8C\uC784 \uBD80\uD305 \uBAA8\uB4DC \uC124\uCE58\uB428 (\uC9C0\uAE08\uC740 \uC77C\uBC18 \uBD80\uD305)')
+  StateGameIn = [regex]::Unescape('\uD604\uC7AC \uC0C1\uD0DC: \uAC8C\uC784 \uBD80\uD305 \uC911 - \uC6D0\uBCF5\uC740 \uC77C\uBC18 \uBD80\uD305\uC73C\uB85C \uC7AC\uC2DC\uC791\uD55C \uB4A4\uC5D0')
+  BtnApply = [regex]::Unescape('\uC801\uC6A9 (PC\uBC29, \uC7AC\uBD80\uD305 \uC5C6\uC74C)')
+  BtnCheck = [regex]::Unescape('\uC810\uAC80\uB9CC (\uC544\uBB34\uAC83\uB3C4 \uC548 \uBC14\uAFC8)')
+  BtnGameInstall = [regex]::Unescape('\uAC8C\uC784 \uBD80\uD305 \uBAA8\uB4DC \uC124\uCE58 (\uB0B4 PC)')
+  BtnGameReboot = [regex]::Unescape('\uAC8C\uC784 \uBAA8\uB4DC\uB85C \uC7AC\uBD80\uD305')
+  BtnRevert = [regex]::Unescape('\uC6D0\uBCF5')
+  BtnUsb = [regex]::Unescape('USB \uD3EC\uD2B8 \uD655\uC778')
+  Running = [regex]::Unescape('\uC2E4\uD589 \uC911... \uB05D\uB0A0 \uB54C\uAE4C\uC9C0 \uAE30\uB2E4\uB824 \uC8FC\uC138\uC694')
+  DoneOk = [regex]::Unescape('\uC644\uB8CC - \uC131\uACF5 {0}, \uAC74\uB108\uB700 {1}, \uC810\uAC80 {2}, \uC2E4\uD328 {3}')
+  DoneFail = [regex]::Unescape('\uC2E4\uD328 (\uCF54\uB4DC {0}) - \uC131\uACF5 {1}, \uAC74\uB108\uB700 {2}, \uC810\uAC80 {3}, \uC2E4\uD328 {4}. \uC544\uB798 \uAE30\uB85D\uC744 \uD655\uC778\uD558\uC138\uC694')
+  DoneNoTable = [regex]::Unescape('\uB05D (\uCF54\uB4DC {0}) - \uC544\uB798 \uAE30\uB85D\uC744 \uD655\uC778\uD558\uC138\uC694')
+  ConfirmRevert = [regex]::Unescape('\uC774 \uD0A4\uD2B8\uAC00 \uBC14\uAFBC \uC124\uC815\uC744 \uC804\uBD80 \uB418\uB3CC\uB9B4\uAE4C\uC694?')
+  ConfirmGameReboot = [regex]::Unescape('\uC9C0\uAE08 \uAC8C\uC784 \uBAA8\uB4DC\uB85C \uC7AC\uBD80\uD305\uD560\uAE4C\uC694? \uC800\uC7A5 \uC548 \uD55C \uC791\uC5C5\uC740 \uBA3C\uC800 \uC800\uC7A5\uD558\uC138\uC694.')
+  AskRebootAfterInstall = [regex]::Unescape('\uAC8C\uC784 \uBD80\uD305 \uBAA8\uB4DC\uB97C \uC124\uCE58\uD588\uC2B5\uB2C8\uB2E4. \uC9C0\uAE08 \uAC8C\uC784 \uBAA8\uB4DC\uB85C \uC7AC\uBD80\uD305\uD560\uAE4C\uC694? (\uB098\uC911\uC5D0 \uBC14\uD0D5\uD654\uBA74 \uC544\uC774\uCF58\uC73C\uB85C\uB3C4 \uB429\uB2C8\uB2E4)')
+  BusyClose = [regex]::Unescape('\uC544\uC9C1 \uC2E4\uD589 \uC911\uC785\uB2C8\uB2E4. \uB05D\uB09C \uB4A4\uC5D0 \uB2EB\uC544 \uC8FC\uC138\uC694.')
+  Footer = [regex]::Unescape('\uB864 \uAC8C\uC784\uC5D0 \uB4E4\uC5B4\uAC00\uAE30 \uC804\uC5D0 \uC2E4\uD589\uD558\uC138\uC694. \uB9C8\uC6B0\uC2A4/\uD0A4\uBCF4\uB4DC \uD3EC\uD2B8\uB97C \uBC14\uAFB8\uBA74 \uC6D0\uBCF5 \uD6C4 \uB2E4\uC2DC \uC801\uC6A9\uD558\uC138\uC694.')
+}
+
+# The runner owns the child process.  Its output callbacks run on threadpool threads,
+# where no runspace exists, so a PowerShell scriptblock would throw there; the lines are
+# queued in C# and drained by the WinForms timer on the UI thread instead.  CreateNoWindow
+# gives the child a hidden console, and console tools it spawns inherit that console, so a
+# grandchild (cmd, ping, powercfg) shows no window either.
+$script:PcbGuiCs = @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Windows.Forms;
+
+public class PcbGuiForm : Form
+{
+    public bool NoActivate = false;
+    protected override bool ShowWithoutActivation { get { return NoActivate; } }
+}
+
+public class PcbGuiRunner
+{
+    private Process proc;
+    private readonly ConcurrentQueue<string> queue = new ConcurrentQueue<string>();
+    private volatile bool outDone;
+    private volatile bool errDone;
+
+    public int Pid { get { return proc == null ? 0 : proc.Id; } }
+
+    public void Start(string exe, string args)
+    {
+        ProcessStartInfo si = new ProcessStartInfo(exe, args);
+        si.UseShellExecute = false;
+        si.CreateNoWindow = true;
+        si.RedirectStandardInput = true;
+        si.RedirectStandardOutput = true;
+        si.RedirectStandardError = true;
+        outDone = false;
+        errDone = false;
+        proc = new Process();
+        proc.StartInfo = si;
+        proc.OutputDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data == null) { outDone = true; } else { queue.Enqueue(e.Data); } };
+        proc.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data == null) { errDone = true; } else { queue.Enqueue("ERR: " + e.Data); } };
+        proc.Start();
+        proc.StandardInput.Close();
+        proc.BeginOutputReadLine();
+        proc.BeginErrorReadLine();
+    }
+
+    public string[] Drain()
+    {
+        List<string> l = new List<string>();
+        string s;
+        while (queue.TryDequeue(out s)) { l.Add(s); }
+        return l.ToArray();
+    }
+
+    public bool Running { get { return proc != null && !(proc.HasExited && outDone && errDone); } }
+    public bool Finished { get { return proc != null && proc.HasExited && outDone && errDone; } }
+    public int ExitCode { get { return proc.ExitCode; } }
+    public void Kill() { try { if (proc != null && !proc.HasExited) { proc.Kill(); } } catch { } }
+}
+'@
+
+$script:PcbGuiNativeReady = $false
+
+function Initialize-PcbGuiNative {
+  if (-not ('PcbGuiRunner' -as [type])) {
+    Add-Type -TypeDefinition $script:PcbGuiCs -ReferencedAssemblies System.Windows.Forms, System.Drawing -ErrorAction Stop
+  }
+  $script:PcbGuiNativeReady = $true
+  return $true
+}
+
+# --- state ---------------------------------------------------------------
+# The four states the buttons are derived from, read straight from the state folder so a
+# throw-away -StateDir works exactly like the real one.
+function Get-PcbGuiState([string]$Dir, [string]$Booted) {
+  $st = @{ Applied = $false; GameInstalled = $false; GameId = ''; InGame = $false }
+  if (Test-Path -LiteralPath (Join-Path $Dir 'state.json')) { $st.Applied = $true }
+  $gf = Join-Path $Dir 'game.json'
+  if (Test-Path -LiteralPath $gf) {
+    $st.GameInstalled = $true
+    $obj = $null
+    try { $obj = [System.IO.File]::ReadAllText($gf, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json } catch { $obj = $null }
+    if ($null -ne $obj) { $st.GameId = [string](Get-PcbStateField $obj 'GameId') }
+    if ($st.GameId -ne '' -and $Booted -ieq $st.GameId) { $st.InGame = $true }
+  }
+  return $st
+}
+
+function Get-PcbGuiButtons($St) {
+  $b = [ordered]@{}
+  $b['apply'] = (-not [bool]$St.Applied -and -not [bool]$St.GameInstalled)
+  $b['check'] = $true
+  $b['gameinstall'] = (-not [bool]$St.Applied -and -not [bool]$St.GameInstalled)
+  $b['gamereboot'] = ([bool]$St.GameInstalled -and -not [bool]$St.InGame)
+  $b['revert'] = (([bool]$St.Applied -or [bool]$St.GameInstalled) -and -not [bool]$St.InGame)
+  $b['usb'] = $true
+  return $b
+}
+
+function Get-PcbGuiStateKey($St) {
+  if ([bool]$St.InGame) { return 'StateGameIn' }
+  if ([bool]$St.GameInstalled) { return 'StateGameOffice' }
+  if ([bool]$St.Applied) { return 'StateApplied' }
+  return 'StateNone'
+}
+
+# --- argument lines ------------------------------------------------------
+# Same switches the one-liners pass, plus -NoPause: the child's output is captured, so a
+# "Press Enter" would never be answered.  -StateDir is only added when it is not the real
+# one (a test folder), because the child defaults to it anyway.
+function Get-PcbGuiArgs([string]$Action, [string]$Self, [string]$Dir) {
+  $b = '-NoProfile -ExecutionPolicy Bypass -File "' + $Self + '"'
+  switch ($Action) {
+    'apply' { $b = $b + ' -NoPause' }
+    'check' { $b = $b + ' -DryRun -GameBoot -NoPause' }
+    'gameinstall' { $b = $b + ' -GameBoot -NoRebootPrompt -NoPause' }
+    'gamereboot' { $b = $b + ' -GameReboot -NoPause' }
+    'revert' { $b = $b + ' -Revert -NoPause' }
+    'usb' { $b = $b + ' -UsbScan' }
+    default { throw ('unknown GUI action: ' + $Action) }
+  }
+  $def = "$env:ProgramData\pcbang-tune"
+  if ($Action -ne 'usb' -and $Dir -ne $def) { $b = $b + ' -StateDir "' + $Dir + '"' }
+  return $b
+}
+
+# --- summary -------------------------------------------------------------
+# The report columns are fixed: Step 4 + Item 34 + Before 40 + After 40 chars, each
+# followed by one space, so Status begins at offset 122.  Count the last table only: a
+# child prints one report per run, but a dry run also echoes earlier text.
+function ConvertTo-PcbGuiSummary([string[]]$Lines) {
+  $res = @{ Table = $false; Ok = 0; Skip = 0; Dry = 0; Fail = 0; Other = 0 }
+  $at = -1
+  for ($i = 0; $i -lt $Lines.Count; $i++) {
+    if ($Lines[$i] -match '^Step\s+Item\s+Before\s+After\s+Status\s*$') { $at = $i }
+  }
+  if ($at -lt 0) { return $res }
+  $res.Table = $true
+  for ($i = $at + 1; $i -lt $Lines.Count; $i++) {
+    $ln = [string]$Lines[$i]
+    if ($ln.Trim() -eq '') { break }
+    if ($ln -match '^-\s*-\s*-\s*-') { continue }
+    $stt = ''
+    if ($ln.Length -gt 122) { $stt = $ln.Substring(122).Trim() }
+    if ($stt -match '^OK') { $res.Ok++ }
+    elseif ($stt -match '^SKIP') { $res.Skip++ }
+    elseif ($stt -match '^DRYRUN') { $res.Dry++ }
+    elseif ($stt -match '^FAIL') { $res.Fail++ }
+    else { $res.Other++ }
+  }
+  return $res
+}
+
+function Get-PcbGuiSummaryText([string]$Action, [string[]]$Lines, [int]$Rc) {
+  $out = @{ Text = ''; Ok = $false }
+  $s = $script:PcbGuiS
+  if ($Action -eq 'usb') {
+    $out.Text = ($s.DoneNoTable -f $Rc)
+    $out.Ok = ($Rc -eq 0)
+    return $out
+  }
+  $c = ConvertTo-PcbGuiSummary $Lines
+  if (-not [bool]$c.Table) {
+    $out.Text = ($s.DoneNoTable -f $Rc)
+    $out.Ok = ($Rc -eq 0)
+    return $out
+  }
+  if ($Rc -eq 0 -and $c.Fail -eq 0) {
+    $out.Text = ($s.DoneOk -f $c.Ok, $c.Skip, $c.Dry, $c.Fail)
+    $out.Ok = $true
+  } else {
+    $out.Text = ($s.DoneFail -f $Rc, $c.Ok, $c.Skip, $c.Dry, $c.Fail)
+    $out.Ok = $false
+  }
+  return $out
+}
+
+# --- window --------------------------------------------------------------
+function New-PcbGuiForm {
+  Add-Type -AssemblyName System.Windows.Forms | Out-Null
+  Add-Type -AssemblyName System.Drawing | Out-Null
+  Initialize-PcbGuiNative | Out-Null
+  $s = $script:PcbGuiS
+
+  $form = New-Object PcbGuiForm
+  $form.Text = $s.Title
+  $form.Font = New-Object System.Drawing.Font('Malgun Gothic', 10)
+  $form.ClientSize = New-Object System.Drawing.Size(820, 640)
+  $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+  $form.MaximizeBox = $false
+  $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+
+  $state = New-Object System.Windows.Forms.Label
+  $state.Location = New-Object System.Drawing.Point(16, 12)
+  $state.Size = New-Object System.Drawing.Size(788, 26)
+  $state.Font = New-Object System.Drawing.Font('Malgun Gothic', 10, [System.Drawing.FontStyle]::Bold)
+  $state.Text = $s.StateNone
+  $form.Controls.Add($state)
+
+  $summary = New-Object System.Windows.Forms.Label
+  $summary.Location = New-Object System.Drawing.Point(16, 196)
+  $summary.Size = New-Object System.Drawing.Size(788, 26)
+  $summary.Text = ''
+  $form.Controls.Add($summary)
+
+  $log = New-Object System.Windows.Forms.TextBox
+  $log.Location = New-Object System.Drawing.Point(16, 226)
+  $log.Size = New-Object System.Drawing.Size(788, 372)
+  $log.Multiline = $true
+  $log.ReadOnly = $true
+  $log.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
+  $log.WordWrap = $false
+  $log.Font = New-Object System.Drawing.Font('Consolas', 9)
+  $log.BackColor = [System.Drawing.Color]::White
+  $form.Controls.Add($log)
+
+  $footer = New-Object System.Windows.Forms.Label
+  $footer.Location = New-Object System.Drawing.Point(16, 606)
+  $footer.Size = New-Object System.Drawing.Size(788, 26)
+  $footer.ForeColor = [System.Drawing.Color]::DimGray
+  $footer.Text = $s.Footer
+  $form.Controls.Add($footer)
+
+  # rows: apply|check, gameinstall|gamereboot, revert|usb - the same order the rules use.
+  $defs = @(
+    @{ Key = 'apply'; Text = $s.BtnApply; X = 16; Y = 48 },
+    @{ Key = 'check'; Text = $s.BtnCheck; X = 416; Y = 48 },
+    @{ Key = 'gameinstall'; Text = $s.BtnGameInstall; X = 16; Y = 96 },
+    @{ Key = 'gamereboot'; Text = $s.BtnGameReboot; X = 416; Y = 96 },
+    @{ Key = 'revert'; Text = $s.BtnRevert; X = 16; Y = 144 },
+    @{ Key = 'usb'; Text = $s.BtnUsb; X = 416; Y = 144 }
+  )
+  $buttons = [ordered]@{}
+  foreach ($d in $defs) {
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = $d.Text
+    $btn.Tag = $d.Key
+    $btn.Location = New-Object System.Drawing.Point($d.X, $d.Y)
+    $btn.Size = New-Object System.Drawing.Size(388, 40)
+    $form.Controls.Add($btn)
+    $buttons[$d.Key] = $btn
+  }
+
+  return @{ Form = $form; State = $state; Summary = $summary; Log = $log; Footer = $footer; Buttons = $buttons }
+}
+
+# --- the window itself ---------------------------------------------------
+function Show-PcbGui {
+  param(
+    [string]$Self = '',
+    [int]$TestSec = 0,
+    [string]$ShotPath = '',
+    [string]$TestAction = '',
+    [string]$LogOut = ''
+  )
+  # 'checkx2' runs the check twice in one window: the second run proves the drain timer is
+  # restarted after the first one stopped it.
+  if ($TestAction -ne '' -and $TestAction -ne 'check' -and $TestAction -ne 'checkx2') {
+    Write-Output ('GuiTestAction not allowed: ' + $TestAction)
+    return 4
+  }
+  $s = $script:PcbGuiS
+  $ui = New-PcbGuiForm
+  $form = $ui.Form
+  $testMode = ($TestSec -gt 0)
+  if ($testMode) {
+    # never steal focus and never appear in the taskbar: a test must not interrupt a game
+    $form.NoActivate = $true
+    $form.ShowInTaskbar = $false
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $form.Location = New-Object System.Drawing.Point(-3000, -3000)
+  }
+  if ($Self -eq '') { $Self = [string]$script:PcbSelfPath }
+  if ($Self -eq '') { $Self = [string]$PSCommandPath }
+
+  $g = @{
+    Runner = $null
+    Lines = (New-Object System.Collections.ArrayList)
+    Action = ''
+    Rc = $null
+    Summary = ''
+    StateKey = 'StateNone'
+    Done = $false
+    Runs = 0
+  }
+
+  $shotFull = ''
+  if ($ShotPath -ne '') {
+    if ([System.IO.Path]::IsPathRooted($ShotPath)) { $shotFull = $ShotPath }
+    else { $shotFull = Join-Path (Get-Location).Path $ShotPath }
+    $dir = [System.IO.Path]::GetDirectoryName($shotFull)
+    if (-not [string]::IsNullOrEmpty($dir) -and -not [System.IO.Directory]::Exists($dir)) {
+      [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+    }
+  }
+  $logFull = ''
+  if ($LogOut -ne '') {
+    if ([System.IO.Path]::IsPathRooted($LogOut)) { $logFull = $LogOut }
+    else { $logFull = Join-Path (Get-Location).Path $LogOut }
+    $ldir = [System.IO.Path]::GetDirectoryName($logFull)
+    if (-not [string]::IsNullOrEmpty($ldir) -and -not [System.IO.Directory]::Exists($ldir)) {
+      [System.IO.Directory]::CreateDirectory($ldir) | Out-Null
+    }
+  }
+
+  # the booted entry is only asked for when game boot mode is installed: a plain PC must
+  # not pay for a bcdedit call just to open the window.
+  $refresh = {
+    $booted = ''
+    if (Test-Path -LiteralPath (Join-Path $StateDir 'game.json')) { $booted = [string](Get-PcbBootedId) }
+    $st = Get-PcbGuiState $StateDir $booted
+    $key = Get-PcbGuiStateKey $st
+    $g.StateKey = $key
+    $ui.State.Text = $s[$key]
+    $en = Get-PcbGuiButtons $st
+    $busy = ($null -ne $g.Runner -and $g.Runner.Running)
+    foreach ($k in @($en.Keys)) { $ui.Buttons[$k].Enabled = ([bool]$en[$k] -and -not $busy) }
+  }
+
+  $finish = {
+    if ($shotFull -ne '') {
+      try {
+        $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
+        $rect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
+        $form.DrawToBitmap($bmp, $rect)
+        $bmp.Save($shotFull, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+      } catch { }
+    }
+    if ($logFull -ne '') {
+      try {
+        $rcText = 'none'
+        if ($null -ne $g.Rc) { $rcText = [string]$g.Rc }
+        $body = @()
+        foreach ($l in @($g.Lines)) { $body += [string]$l }
+        $body += ('SUMMARY ' + [string]$g.Summary)
+        $body += ('RC ' + $rcText)
+        $body += ('STATE ' + [string]$g.StateKey)
+        $body += ('RUNS ' + [string]$g.Runs)
+        [System.IO.File]::WriteAllText($logFull, (($body -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+      } catch { }
+    }
+    $g.Done = $true
+    $form.Close()
+  }
+
+  $start = {
+    param([string]$Action)
+    if ($Action -eq '') { return }
+    $msg = $null
+    if ($Action -eq 'revert') { $msg = $s.ConfirmRevert }
+    elseif ($Action -eq 'gamereboot') { $msg = $s.ConfirmGameReboot }
+    if ($null -ne $msg) {
+      $r = [System.Windows.Forms.MessageBox]::Show($msg, $s.Title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+      if ($r -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    }
+    $g.Action = $Action
+    $g.Rc = $null
+    $g.Summary = $s.Running
+    $ui.Summary.ForeColor = [System.Drawing.Color]::Black
+    $ui.Summary.Text = $s.Running
+    $ui.Log.Text = ''
+    $g.Lines.Clear()
+    foreach ($k in @($ui.Buttons.Keys)) { $ui.Buttons[$k].Enabled = $false }
+    $r = New-Object PcbGuiRunner
+    $g.Runner = $r
+    $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $argLine = Get-PcbGuiArgs $Action $Self $StateDir
+    # the tick handler stops the timer when a run ends, so every run starts it again
+    try { $r.Start($exe, $argLine); $g.Runs++; $timer.Start() } catch {
+      [void]$g.Lines.Add('run failed: ' + $_.Exception.Message)
+      $ui.Log.AppendText('run failed: ' + $_.Exception.Message + "`r`n")
+      $g.Rc = 1
+      $res = Get-PcbGuiSummaryText $Action @() 1
+      $g.Summary = $res.Text
+      $ui.Summary.Text = $res.Text
+      $ui.Summary.ForeColor = [System.Drawing.Color]::DarkRed
+      $g.Runner = $null
+      & $refresh
+    }
+  }
+
+  foreach ($k in @($ui.Buttons.Keys)) {
+    $ui.Buttons[$k].Add_Click({ & $start ([string]$this.Tag) })
+  }
+
+  $timer = New-Object System.Windows.Forms.Timer
+  $timer.Interval = 100
+  $timer.Add_Tick({
+    $r = $g.Runner
+    if ($null -eq $r) { return }
+    foreach ($l in @($r.Drain())) {
+      [void]$g.Lines.Add([string]$l)
+      $ui.Log.AppendText([string]$l + "`r`n")
+    }
+    if (-not $r.Finished) { return }
+    foreach ($l in @($r.Drain())) {
+      [void]$g.Lines.Add([string]$l)
+      $ui.Log.AppendText([string]$l + "`r`n")
+    }
+    $timer.Stop()
+    $g.Rc = $r.ExitCode
+    $res = Get-PcbGuiSummaryText $g.Action ([string[]]@($g.Lines)) ([int]$g.Rc)
+    $g.Summary = $res.Text
+    $ui.Summary.Text = $res.Text
+    if ([bool]$res.Ok) { $ui.Summary.ForeColor = [System.Drawing.Color]::DarkGreen }
+    else { $ui.Summary.ForeColor = [System.Drawing.Color]::DarkRed }
+    & $refresh
+    if ($testMode) {
+      if ($TestAction -eq 'checkx2' -and $g.Runs -lt 2) { & $start 'check'; return }
+      & $finish
+      return
+    }
+    if ($g.Action -eq 'gameinstall' -and [int]$g.Rc -eq 0) {
+      $q = [System.Windows.Forms.MessageBox]::Show($s.AskRebootAfterInstall, $s.Title, [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+      if ($q -eq [System.Windows.Forms.DialogResult]::Yes) { & $start 'gamereboot' }
+    }
+  })
+
+  $form.Add_FormClosing({
+    if ($null -ne $g.Runner -and $g.Runner.Running) {
+      if ($testMode) {
+        $g.Runner.Kill()
+      } else {
+        $_.Cancel = $true
+        [void][System.Windows.Forms.MessageBox]::Show($s.BusyClose, $s.Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+      }
+    }
+  })
+
+  $form.Add_Shown({
+    & $refresh
+    # started hidden behind a UAC prompt, the window may open behind the browser
+    if (-not $testMode) { $form.Activate() }
+    if ($TestAction -eq 'check' -or $TestAction -eq 'checkx2') { $ui.Buttons['check'].PerformClick() }
+    elseif ($testMode) { & $finish }
+  })
+
+  $endAt = $null
+  if ($TestSec -gt 0) { $endAt = (Get-Date).AddSeconds($TestSec) }
+  $timedOut = $false
+
+  $timer.Start()
+  $form.Show()
+  while ($form.Visible) {
+    [System.Windows.Forms.Application]::DoEvents()
+    if ($null -ne $endAt -and (Get-Date) -ge $endAt) {
+      $timedOut = $true
+      $timer.Stop()
+      if ($null -ne $g.Runner -and $g.Runner.Running) { $g.Runner.Kill() }
+      & $finish
+    }
+    Start-Sleep -Milliseconds 20
+  }
+
+  if ($timedOut) { return 3 }
+  if ($null -ne $g.Rc) { return [int]$g.Rc }
+  return 0
+}
+
+# ==== end gui.ps1 ====
+
+
+# ---------------------------------------------------------------------------
+# PC-bang one-click gaming tweak kit.  Stock Windows PowerShell 5.1, ASCII only.
+# ---------------------------------------------------------------------------
+
+$script:PcbNewScheme = 'a5f0c0de-1a7e-4c0a-9b1e-00000000a001'
+$script:PcbSchemeNames = @('e9a42b02-d5df-448d-aa00-03f14749eb61','8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c')
+$script:SubProcessor = '54533251-82be-4824-96c1-47b60b740d00'
+$script:SubUsb = '2a737441-1930-4402-8d77-b2bebba308a3'
+$script:PcbRows = New-Object System.Collections.ArrayList
+$script:PcbState = @{}
+$script:PcbStateDirty = $false
+$script:PcbSelfPath = $null
+# DirectX user preferences target; -DxPrefsPath/-DxPrefsName let a test drive a
+# throw-away key instead of the real HKCU\Software\Microsoft\DirectX one.
+$script:PcbDxPath = $DxPrefsPath
+$script:PcbDxName = $DxPrefsName
+
+# ===========================================================================
+# generic helpers
+# ===========================================================================
+
+function Write-PcbLine([string]$text) {
+  # straight to stdout so Invoke-PcbMain's return value stays the exit code.
+  # multi-line text is written line by line: folding CR/LF to '?' would collapse the
+  # whole report table into one row.  the 7-bit folding still applies per line.
+  if ($null -eq $text) { $text = '' }
+  $body = [regex]::Replace($text, '(\r\n|\n|\r)$', '')
+  foreach ($ln in [regex]::Split($body, '\r\n|\n|\r')) {
+    $safe = [regex]::Replace($ln, '[^\x20-\x7E]', '?')
+    [Console]::Out.WriteLine($safe)
+  }
+}
+
+function Save-PcbState {
+  if ($script:PcbDryRun) { return }
+  try {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+    $json = $script:PcbState | ConvertTo-Json -Depth 8
+    [System.IO.File]::WriteAllText((Join-Path $StateDir 'state.json'), $json, (New-Object System.Text.UTF8Encoding($false)))
+  } catch {
+    Write-PcbLine ("state save failed: " + $_.Exception.Message)
+  }
+}
+
+function Add-PcbRow {
+  param([string]$Step, [string]$Item, $Before, $After, [string]$Status)
+  $row = [pscustomobject]@{ Step = $Step; Item = $Item; Before = $Before; After = $After; Status = $Status }
+  [void]$script:PcbRows.Add($row)
+  return $row
+}
+
+# A revert reloads state.json through ConvertFrom-Json, so every stored record comes back
+# as a PSCustomObject instead of the hashtable the apply run built.  A .ContainsKey() or
+# ['x'] read on such a record is a non-terminating error: the whole restore function dies
+# where it stands and the row it should have printed never appears.  This reader answers
+# for both shapes, the same contract as Get-PcbRecField in src\lolcfg.ps1.
+function Get-PcbStateField($Rec, [string]$Name) {
+  if ($null -eq $Rec) { return $null }
+  if ($Rec -is [System.Collections.IDictionary]) {
+    if ($Rec.Contains($Name)) { return $Rec[$Name] }
+    return $null
+  }
+  $p = $Rec.PSObject.Properties[$Name]
+  if ($null -ne $p) { return $p.Value }
+  return $null
+}
+
+function Get-PcbActiveGuid {
+  try {
+    $txt = (@(powercfg /getactivescheme 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+    $m = [regex]::Match($txt, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+    if ($m.Success) { return $m.Value.ToLower() }
+  } catch { }
+  return $null
+}
+
+function Get-PcbSchemeList {
+  try {
+    $txt = (@(powercfg /list 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+    return @([regex]::Matches($txt, '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}') | ForEach-Object { $_.Value.ToLower() })
+  } catch { return @() }
+}
+
+# ===========================================================================
+# native interop
+# ===========================================================================
+
+$script:PcbNativeCode = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class PcbNative
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DISPLAY_DEVICE
+    {
+        [MarshalAs(UnmanagedType.U4)] public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        [MarshalAs(UnmanagedType.U4)] public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public int dmFields;
+        public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency,
+                   dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2,
+                   dmPanningWidth, dmPanningHeight;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool EnumDisplayDevicesW(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool EnumDisplaySettingsW(string lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int ChangeDisplaySettingsExW(string lpszDeviceName, ref DEVMODE lpDevMode, IntPtr hwnd, uint dwflags, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SystemParametersInfoW(uint uiAction, uint uiParam, int[] pvParam, uint fWinIni);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern bool SystemParametersInfoW(uint uiAction, uint uiParam, ref int pvParam, uint fWinIni);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetLogicalProcessorInformationEx(int relationshipType, IntPtr buffer, ref uint returnedLength);
+
+    public static string[] DisplayDevices()
+    {
+        List<string> o = new List<string>();
+        DISPLAY_DEVICE d = new DISPLAY_DEVICE();
+        d.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        for (uint i = 0; EnumDisplayDevicesW(null, i, ref d, 0); i++)
+        {
+            o.Add(d.DeviceName + "|" + d.DeviceString + "|" + d.StateFlags);
+            d = new DISPLAY_DEVICE();
+            d.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+        }
+        return o.ToArray();
+    }
+
+    public static string CurrentMode(string dev)
+    {
+        DEVMODE d = new DEVMODE();
+        d.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        if (!EnumDisplaySettingsW(dev, -1, ref d)) { return null; }
+        return d.dmPelsWidth + "|" + d.dmPelsHeight + "|" + d.dmBitsPerPel + "|" + d.dmDisplayFrequency;
+    }
+
+    public static string[] AllModes(string dev)
+    {
+        List<string> o = new List<string>();
+        for (int i = 0; i < 4096; i++)
+        {
+            DEVMODE d = new DEVMODE();
+            d.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            if (!EnumDisplaySettingsW(dev, i, ref d)) { break; }
+            o.Add(d.dmPelsWidth + "|" + d.dmPelsHeight + "|" + d.dmBitsPerPel + "|" + d.dmDisplayFrequency);
+        }
+        return o.ToArray();
+    }
+
+    public static int SetMode(string dev, int w, int h, int bpp, int hz)
+    {
+        DEVMODE d = new DEVMODE();
+        d.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        d.dmFields = 0x00080000 | 0x00100000 | 0x00040000 | 0x00400000;
+        d.dmPelsWidth = w;
+        d.dmPelsHeight = h;
+        d.dmBitsPerPel = bpp;
+        d.dmDisplayFrequency = hz;
+        return ChangeDisplaySettingsExW(dev, ref d, IntPtr.Zero, 0x1, IntPtr.Zero);
+    }
+
+    public static int[] GetMouseAccel()
+    {
+        int[] v = new int[3];
+        if (!SystemParametersInfoW(0x0003, 0, v, 0)) { return null; }
+        return v;
+    }
+
+    public static bool SetMouseAccel(int a, int b, int c)
+    {
+        int[] v = new int[] { a, b, c };
+        return SystemParametersInfoW(0x0004, 0, v, 0x3);
+    }
+
+    public static int GetMouseSpeed()
+    {
+        int v = 0;
+        if (!SystemParametersInfoW(0x0070, 0, ref v, 0)) { return -1; }
+        return v;
+    }
+
+    public static bool SetMouseSpeed(int s)
+    {
+        int v = s;
+        return SystemParametersInfoW(0x0071, 0, ref v, 0x3);
+    }
+
+    public static string[] CoreRelations()
+    {
+        List<string> o = new List<string>();
+        // GetLogicalProcessorInformationEx only ever returns the ONE relationship type it
+        // was asked for: type 0 is RelationProcessorCore, type 2 is RelationCache.  The
+        // first call must therefore be made per type, or the cache records simply never
+        // show up.
+        Collect(o, 0);
+        Collect(o, 2);
+        return o.ToArray();
+    }
+
+    private static void Collect(List<string> o, int relation)
+    {
+        uint len = 0;
+        GetLogicalProcessorInformationEx(relation, IntPtr.Zero, ref len);
+        if (len == 0) { return; }
+        IntPtr buf = Marshal.AllocHGlobal((int)len);
+        try
+        {
+            if (!GetLogicalProcessorInformationEx(relation, buf, ref len)) { return; }
+            int off = 0;
+            while (off + 8 <= (int)len)
+            {
+                IntPtr p = (IntPtr)((long)buf + off);
+                int rel = Marshal.ReadInt32(p, 0);
+                int size = Marshal.ReadInt32(p, 4);
+                if (size <= 0) { break; }
+                if (rel == 0 && size >= 40)
+                {
+                    byte cls = Marshal.ReadByte(p, 8 + 1);
+                    int gc = Marshal.ReadInt16(p, 8 + 22) & 0xFFFF;
+                    for (int g = 0; g < gc; g++)
+                    {
+                        int baseOff = 8 + 24 + g * 16;
+                        if (baseOff + 10 > size) { break; }
+                        long mask = Marshal.ReadInt64(p, baseOff);
+                        int grp = Marshal.ReadInt16(p, baseOff + 8) & 0xFFFF;
+                        o.Add(cls + "|" + mask + "|" + grp);
+                    }
+                }
+                // RelationCache == 2.  CACHE_RELATIONSHIP (winnt.h, um/winnt.h in the
+                // 10.0.26100.0 SDK): Level BYTE @0, Associativity BYTE @1, LineSize WORD
+                // @2, CacheSize DWORD @4, Type (4-byte enum) @8, Reserved[18] @12,
+                // GroupCount WORD @30, union GroupMask @32 (GROUP_AFFINITY: Mask 8 bytes,
+                // Group WORD).  The record header is 8 bytes, so add 8 to every offset.
+                if (rel == 2 && size >= 56)
+                {
+                    int lvl = Marshal.ReadByte(p, 8 + 0);
+                    int csize = Marshal.ReadInt32(p, 8 + 4);
+                    int gc = Marshal.ReadInt16(p, 8 + 30) & 0xFFFF;
+                    for (int g = 0; g < gc; g++)
+                    {
+                        int baseOff = 8 + 32 + g * 16;
+                        if (baseOff + 10 > size) { break; }
+                        long mask = Marshal.ReadInt64(p, baseOff);
+                        int grp = Marshal.ReadInt16(p, baseOff + 8) & 0xFFFF;
+                        o.Add("L|" + lvl + "|" + mask + "|" + grp + "|" + csize);
+                    }
+                }
+                off += size;
+            }
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+    }
+}
+'@
+
+function Initialize-PcbNative {
+  if (-not ([System.Management.Automation.PSTypeName]'PcbNative').Type) {
+    Add-Type -TypeDefinition $script:PcbNativeCode -Language CSharp -ErrorAction Stop
+  }
+}
+
+# ===========================================================================
+# CPU masks
+# ===========================================================================
+
+function Get-PcbCoreList {
+  Initialize-PcbNative
+  $res = [PcbNative]::CoreRelations()
+  $list = New-Object System.Collections.ArrayList
+  foreach ($line in @($res)) {
+    $p = ([string]$line).Split('|')
+    if ($p.Count -lt 3) { continue }
+    if ([int]$p[2] -ne 0) { continue }   # group 0 only
+    [void]$list.Add([pscustomobject]@{ Class = [int]$p[0]; Mask = [uint64]$p[1] })
+  }
+  return @($list)
+}
+
+# L3 caches of group 0: @([pscustomobject]@{ Mask = <uint64>; Size = <bytes> })
+# Cache records are tagged 'L|<level>|<mask>|<group>|<size>' by PcbNative.CoreRelations.
+function Get-PcbL3List {
+  Initialize-PcbNative
+  $res = [PcbNative]::CoreRelations()
+  $list = New-Object System.Collections.ArrayList
+  foreach ($line in @($res)) {
+    $p = ([string]$line).Split('|')
+    if ($p.Count -lt 5) { continue }
+    if ($p[0] -ne 'L') { continue }
+    if ([int]$p[1] -ne 3) { continue }
+    if ([int]$p[3] -ne 0) { continue }   # group 0 only
+    [void]$list.Add([pscustomobject]@{ Mask = [uint64]$p[2]; Size = [int]$p[4] })
+  }
+  return @($list)
+}
+
+function Get-PcbMasks {
+  param([object[]]$Cores, [object[]]$L3)
+  $injected = $PSBoundParameters.ContainsKey('Cores') -and ($null -ne $Cores)
+  if (-not $injected) { $Cores = @(Get-PcbCoreList) }
+  $l3Given = $PSBoundParameters.ContainsKey('L3') -and ($null -ne $L3)
+  $game = [uint64]0
+  $side = [uint64]0
+  $irq = [uint64]0
+  if ($Cores.Count -eq 0) {
+    return [pscustomobject]@{ GameMask = $game; SideMask = $side; IrqMask = $irq }
+  }
+  $pclass = 0
+  foreach ($c in $Cores) { if ([int]$c.Class -gt $pclass) { $pclass = [int]$c.Class } }
+  $P = @($Cores | Where-Object { [int]$_.Class -eq $pclass })
+  $E = @($Cores | Where-Object { [int]$_.Class -ne $pclass })
+  $orP = [uint64]0
+  foreach ($c in $P) { $orP = $orP -bor [uint64]$c.Mask }
+  if ($E.Count -gt 0) {
+    $eOr = [uint64]0
+    foreach ($c in $E) { $eOr = $eOr -bor [uint64]$c.Mask }
+    $side = $eOr
+  } else {
+    $side = [uint64]$P[0].Mask
+  }
+
+  # X3D split: on a 3D V-Cache part the large L3 sits on one CCD and the small L3 on
+  # the other, so the masks have to follow the cache instead of "everything but cpu 0".
+  # Only when the L3 story is unambiguous: >= 2 distinct masks and >= 2 distinct sizes.
+  $l3Use = $null
+  if ($P.Count -ge 6) {
+    if (-not $l3Given) {
+      try { $L3 = @(Get-PcbL3List) } catch { $L3 = @() }
+    }
+    $l3All = @($L3)
+    $masks = @{}
+    $sizes = @{}
+    foreach ($e in $l3All) {
+      if ($null -eq $e) { continue }
+      $mm = [uint64]$e.Mask
+      if ($mm -eq 0) { continue }
+      $masks[[string]$mm] = 1
+      $sizes[[string]([int]$e.Size)] = 1
+    }
+    if ($masks.Count -ge 2 -and $sizes.Count -ge 2) {
+      $best = $null
+      foreach ($e in $l3All) {
+        if ($null -eq $e) { continue }
+        if ($null -eq $best -or [int]$e.Size -gt [int]$best.Size) { $best = $e }
+      }
+      if ($null -ne $best) { $l3Use = [uint64]$best.Mask }
+    }
+  }
+
+  if ($P.Count -ge 6) {
+    # Non-SMT: one bit per physical core, so P[0].Mask alone is a SINGLE logical CPU and
+    # mouse + GPU + NIC would all share it.  Hand the interrupt set P[0] and P[1] (two
+    # physical cores) and keep the game off both.  An SMT CPU's P[0].Mask already has
+    # both siblings, so this branch never fires there and the numbers stay as today.
+    $irq = [uint64]$P[0].Mask
+    $irqExtra = [uint64]0
+    $bits = 0
+    for ($i = 0; $i -lt 64; $i++) {
+      if (($irq -band ([uint64]1 -shl $i)) -ne [uint64]0) { $bits++ }
+    }
+    if ($bits -eq 1 -and $P.Count -ge 2) { $irqExtra = [uint64]$P[1].Mask }
+    if ($null -ne $l3Use) {
+      $game = ($orP -band [uint64]$l3Use) -band (-bnot [uint64]$P[0].Mask)
+      $side = $orP -band (-bnot [uint64]$l3Use)
+    } else {
+      $game = $orP -band (-bnot [uint64]$P[0].Mask)
+    }
+    if ($irqExtra -ne [uint64]0) {
+      $irq = $irq -bor $irqExtra
+      $game = $game -band (-bnot $irqExtra)
+    }
+  } else {
+    $game = $orP
+    $irq = [uint64]0
+  }
+  return [pscustomobject]@{ GameMask = $game; SideMask = $side; IrqMask = $irq }
+}
+
+function Format-PcbMask([uint64]$m) { return ('0x{0:X}' -f $m) }
+
+# ===========================================================================
+# step a - power
+# ===========================================================================
+
+function Get-PcbPowerValue([string]$Scheme, [string]$Sub, [string]$Setting) {
+  $txt = (@(powercfg /query $Scheme $Sub $Setting 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+  $ac = $null
+  $dc = $null
+  $m = [regex]::Match($txt, '(?m)^[^\r\n]*\bAC\b[^\r\n]*?(0x[0-9A-Fa-f]{1,8})')
+  if ($m.Success) { $ac = [Convert]::ToInt32($m.Groups[1].Value.Substring(2), 16) }
+  $m = [regex]::Match($txt, '(?m)^[^\r\n]*\bDC\b[^\r\n]*?(0x[0-9A-Fa-f]{1,8})')
+  if ($m.Success) { $dc = [Convert]::ToInt32($m.Groups[1].Value.Substring(2), 16) }
+  return [pscustomobject]@{ AC = $ac; DC = $dc }
+}
+
+function Invoke-PcbPowerSet([string]$Scheme, [string]$Sub, [string]$Setting, [int]$Value) {
+  & powercfg /setacvalueindex $Scheme $Sub $Setting $Value 2>&1 | Out-Null
+  $rcA = $LASTEXITCODE
+  & powercfg /setdcvalueindex $Scheme $Sub $Setting $Value 2>&1 | Out-Null
+  $rcD = $LASTEXITCODE
+  if ($rcA -ne 0) {
+    & powercfg -attributes $Sub $Setting -ATTRIB_HIDE 2>&1 | Out-Null
+    & powercfg /setacvalueindex $Scheme $Sub $Setting $Value 2>&1 | Out-Null
+    $rcA = $LASTEXITCODE
+  }
+  return [pscustomobject]@{ AC = $rcA; DC = $rcD }
+}
+
+# A hidden power setting prints only its scheme header, so 'no AC line' is how the kit
+# tells 'hidden' from 'not on this PC' (an unknown GUID fails outright).
+function Test-PcbPowerVisible([string]$Scheme, [string]$Sub, [string]$Setting) {
+  $txt = (@(powercfg /query $Scheme $Sub $Setting 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+  return [bool]($txt -match '(?m)^[^\r\n]*\bAC\b')
+}
+
+# ===========================================================================
+# IDLEDISABLE boost guard
+# ===========================================================================
+#
+# IDLEDISABLE=1 keeps the cores out of the idle state, which is what the home PC runs.
+# On an Intel part whose turbo bin depends on the number of active cores it can also
+# lower the single-core ceiling, so the kit measures instead of assuming: spin a thread
+# pinned to the first game CPU for 400 ms with the value at 0 and again at 1, keep 1
+# only when it costs less than 2 %.  $script:PcbSpeedProbe is a scriptblock returning a
+# positive integer (the iteration count) so a test can inject a fixed pair.
+
+$script:PcbSpeedProbe = $null
+
+$script:PcbSpeedCode = @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class PcbSpeed {
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentThread();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern UIntPtr SetThreadAffinityMask(IntPtr hThread, UIntPtr dwThreadAffinityMask);
+
+    // Pure integer/FP arithmetic: a core that is boosting finishes more work per 400 ms.
+    public static long Spin(int ms, ulong mask) {
+        IntPtr h = GetCurrentThread();
+        UIntPtr old = UIntPtr.Zero;
+        if (mask != 0) {
+            try { old = SetThreadAffinityMask(h, new UIntPtr(mask)); } catch { old = UIntPtr.Zero; }
+        }
+        try {
+            Stopwatch sw = Stopwatch.StartNew();
+            long n = 0;
+            double acc = 0.0;
+            while (sw.ElapsedMilliseconds < ms) {
+                for (int i = 0; i < 2000; i++) {
+                    acc += Math.Sqrt((double)(n + i)) + (acc * 0.5);
+                }
+                n += 2000;
+            }
+            if (acc < 0.0) { return -1; }
+            return n;
+        } finally {
+            if (mask != 0 && old != UIntPtr.Zero) {
+                try { SetThreadAffinityMask(h, old); } catch { }
+            }
+        }
+    }
+}
+'@
+
+function Get-PcbFirstCpu([uint64]$Mask) {
+  for ($i = 0; $i -lt 64; $i++) {
+    if ((($Mask -shr $i) -band 1) -ne 0) { return $i }
+  }
+  return 0
+}
+
+function Invoke-PcbSpeedSpin([uint64]$Mask) {
+  if (-not ([System.Management.Automation.PSTypeName]'PcbSpeed').Type) {
+    Add-Type -TypeDefinition $script:PcbSpeedCode -Language CSharp -ErrorAction Stop
+  }
+  $m = $Mask
+  if ($m -eq 0) { $m = [uint64]1 }
+  return [long][PcbSpeed]::Spin(400, $m)
+}
+
+# Best of three: a single spin is noisy enough to flip a 2 % decision.
+function Measure-PcbSpeed([uint64]$Mask) {
+  if ($null -ne $script:PcbSpeedProbe) {
+    $v = & $script:PcbSpeedProbe
+    $n = 0
+    if ([int]::TryParse([string]$v, [ref]$n)) { return $n }
+    return 0
+  }
+  $best = [long]0
+  for ($i = 0; $i -lt 3; $i++) {
+    $v = Invoke-PcbSpeedSpin $Mask
+    if ($v -gt $best) { $best = $v }
+  }
+  return $best
+}
+
+function Solve-PcbIdleDisable([uint64]$Mask, [string]$Scheme) {
+  # Returns @{ Want; Speed0; Speed1; Decision }.  A zero measurement on either side
+  # means the probe could not run, and then the home value (1) is kept.
+  #
+  # The guard activates $Scheme to make each write take effect.  It is a throw-away
+  # scheme in tests and a freshly duplicated one in production, so leaving it active
+  # when the function exits early or throws would leave the PC on a scheme that is
+  # about to be deleted.  Whatever was active on entry is put back in the finally.
+  $rec = @{ Want = 1; Speed0 = 0; Speed1 = 0; Decision = '' }
+  $prev = Get-PcbActiveGuid
+  try {
+    Invoke-PcbPowerSet $Scheme $script:SubProcessor 'IDLEDISABLE' 0 | Out-Null
+    & powercfg /setactive $Scheme 2>&1 | Out-Null
+    $rec.Speed0 = Measure-PcbSpeed $Mask
+    Invoke-PcbPowerSet $Scheme $script:SubProcessor 'IDLEDISABLE' 1 | Out-Null
+    & powercfg /setactive $Scheme 2>&1 | Out-Null
+    $rec.Speed1 = Measure-PcbSpeed $Mask
+    if ($rec.Speed0 -le 0 -or $rec.Speed1 -le 0) {
+      $rec.Want = 1
+      $rec.Decision = 'probe failed, keeping 1'
+    } elseif ($rec.Speed1 -ge ($rec.Speed0 * 0.98)) {
+      $rec.Want = 1
+      $rec.Decision = 'kept 1'
+    } else {
+      $rec.Want = 0
+      $rec.Decision = 'dropped to 0 (boost loss)'
+    }
+  } catch {
+    $rec.Want = 1
+    $rec.Decision = 'probe error, keeping 1'
+  } finally {
+    # only touch the active scheme when the guard actually moved it, and never when
+    # $prev was unreadable - then leaving $Scheme active is the caller's problem.
+    if ($prev -and $prev -ne 'none') {
+      $now = Get-PcbActiveGuid
+      if ($now -ne $prev) { & powercfg /setactive $prev 2>&1 | Out-Null }
+    }
+  }
+  return $rec
+}
+
+function Get-PcbSchemeCandidates {
+  # Ultimate Performance is often not listed on this PC (it ships as a template only).
+  # -duplicatescheme still accepts the template GUID, so listing is not a gate.
+  if ($null -ne $SchemeCandidates -and @($SchemeCandidates).Count -gt 0) {
+    # 'a,b' arrives as one element when the kit is launched with -File, so split it.
+    $out = New-Object System.Collections.ArrayList
+    foreach ($s in @($SchemeCandidates)) {
+      foreach ($part in ([string]$s).Split(',')) {
+        $p = $part.Trim()
+        if ($p.Length -gt 0) { [void]$out.Add($p) }
+      }
+    }
+    return @($out)
+  }
+  return @($script:PcbSchemeNames)
+}
+
+# step 0 - USB ports.  The IRQ pins of step c follow the controller each input device sits on, so the ports
+# are settled before anything is applied.  All green -> rows only.  Otherwise the live window opens (never in a
+# dry run, never under PCB_NO_USBWINDOW, which the test runners set) and the check is redone after it closes.
+# The game-boot logon child closes the window itself after 90 s so an unattended logon still applies.
+function Invoke-PcbStepUsb {
+  $rows = @()
+  try { $rows = @(Get-PcbUsbInputCheck) } catch { Add-PcbRow 'u' 'usb ports' '' '' ('SKIP: ' + $_.Exception.Message) | Out-Null; return }
+  $off = @($rows | Where-Object { $_.Level -eq 'bad' -or $_.Level -eq 'warn' })
+  if ($off.Count -gt 0 -and -not $script:PcbDryRun -and [string]::IsNullOrEmpty($env:PCB_NO_USBWINDOW)) {
+    Write-PcbLine ('USB: ' + $off.Count + ' input device(s) not on the best port - opening the USB port check window')
+    $a = @{ Hint = $script:PcbUsbS.HintApply }
+    if ($GameChild) { $a['AutoCloseSec'] = 90 }
+    try { [void](Show-PcbUsbScan @a) } catch { Write-PcbLine ('USB window failed: ' + $_.Exception.Message) }
+    try { $rows = @(Get-PcbUsbInputCheck) } catch { }
+  }
+  if ($rows.Count -eq 0) { Add-PcbRow 'u' 'usb ports' '' 'no USB mouse/keyboard found' 'SKIP: nothing to check' | Out-Null; return }
+  foreach ($r in $rows) {
+    $item = 'usb/' + $r.Role + ' ' + $r.Name
+    $after = $r.Level
+    if ($r.Level -eq 'ok') { $after = 'ok (best controller, direct)' }
+    elseif ($r.Level -eq 'warn') { $after = 'through a hub: plug into a rear port directly' }
+    elseif ($r.Level -eq 'bad') { $after = 'move to a CPU-direct port (or: Bluetooth / add-on controller)' }
+    $st = 'OK'
+    if ($script:PcbDryRun) { $st = 'DRYRUN' } elseif ($r.Level -ne 'ok') { $st = 'NOTE: not on the best port' }
+    Add-PcbRow 'u' $item $r.Kind $after $st | Out-Null
+  }
+}
+
+function Invoke-PcbStepPower {
+  param($Masks = $null)
+  $before = Get-PcbActiveGuid
+  $script:PcbState['Power'] = @{ BeforeGuid = $before; NewGuid = $script:PcbNewScheme }
+  Save-PcbState
+  if ($script:PcbDryRun) {
+    Add-PcbRow 'a' 'power/scheme' $before $before 'DRYRUN' | Out-Null
+    foreach ($s in $script:PcbPowerSettings) {
+      Add-PcbRow 'a' ('power/' + $s.Item) ('AC=' + $s.Want + '/DC=' + $s.Want) ('AC=' + $s.Want + '/DC=' + $s.Want) 'DRYRUN' | Out-Null
+    }
+    if ($script:PcbIdleDisableGuard) {
+      Add-PcbRow 'a' 'power/IDLEDISABLE-guard' 'wanted=1' 'measure 0 vs 1' 'DRYRUN' | Out-Null
+    }
+    return
+  }
+  $src = $null
+  $listed = @(Get-PcbSchemeList)
+  $cands = @(Get-PcbSchemeCandidates)
+  $tried = @{}
+  $tries = New-Object System.Collections.ArrayList
+  foreach ($cand in $cands) {
+    if ([string]::IsNullOrWhiteSpace([string]$cand)) { continue }
+    $c = ([string]$cand).ToLower()
+    if ($tried.ContainsKey($c)) { continue }
+    $tried[$c] = 1
+    [void]$tries.Add($c)
+    & powercfg -delete $script:PcbNewScheme 2>&1 | Out-Null
+    & powercfg -duplicatescheme $c $script:PcbNewScheme 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0 -and @(Get-PcbSchemeList) -contains $script:PcbNewScheme) { $src = $c; break }
+  }
+  if ($null -eq $src -and $before -and -not $tried.ContainsKey($before)) {
+    [void]$tries.Add($before)
+    & powercfg -delete $script:PcbNewScheme 2>&1 | Out-Null
+    & powercfg -duplicatescheme $before $script:PcbNewScheme 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0 -and @(Get-PcbSchemeList) -contains $script:PcbNewScheme) { $src = $before }
+  }
+  if ($null -eq $src) {
+    Add-PcbRow 'a' 'power/scheme' $before 'n/a' 'FAIL: no source scheme could be duplicated' | Out-Null
+    return
+  }
+  $srcNote = $src
+  if ($listed -notcontains $src) { $srcNote = $src + ' (not listed)' }
+  & powercfg -changename $script:PcbNewScheme 'PCBang Gaming' 2>&1 | Out-Null
+  $unhidden = New-Object System.Collections.ArrayList
+  $guardNote = ''
+  foreach ($s in $script:PcbPowerSettings) {
+    $cleared = $false
+    if ($s.ContainsKey('Unhide') -and [int]$s.Unhide -eq 1) {
+      # A hidden setting answers only its scheme header, so the kit clears the hide
+      # attribute, writes, and puts the attribute back on revert.
+      if (-not (Test-PcbPowerVisible $script:PcbNewScheme $s.Sub $s.Id)) {
+        & powercfg -attributes $s.Sub $s.Id -ATTRIB_HIDE 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 150
+        if (Test-PcbPowerVisible $script:PcbNewScheme $s.Sub $s.Id) {
+          $cleared = $true
+          [void]$unhidden.Add(@{ Sub = [string]$s.Sub; Id = [string]$s.Id })
+        }
+      }
+    }
+    $pre = Get-PcbPowerValue $script:PcbNewScheme $s.Sub $s.Id
+    if ($null -eq $pre.AC -and $null -eq $pre.DC) {
+      Add-PcbRow 'a' ('power/' + $s.Item) 'absent' 'absent' 'SKIP: not supported here' | Out-Null
+      continue
+    }
+    $want = [int]$s.Want
+    if ($s.Item -eq 'IDLEDISABLE' -and $script:PcbIdleDisableGuard) {
+      $m = $Masks
+      if ($null -eq $m) { try { $m = Get-PcbMasks } catch { $m = $null } }
+      $cpuMask = [uint64]1
+      if ($null -ne $m) { $cpuMask = [uint64]$m.GameMask }
+      $g = Solve-PcbIdleDisable $cpuMask $script:PcbNewScheme
+      $want = [int]$g.Want
+      $guardNote = ('0=' + $g.Speed0 + ' 1=' + $g.Speed1 + ', ' + $g.Decision)
+      $pre = Get-PcbPowerValue $script:PcbNewScheme $s.Sub $s.Id
+    }
+    $rc = Invoke-PcbPowerSet $script:PcbNewScheme $s.Sub $s.Id $want
+    $post = Get-PcbPowerValue $script:PcbNewScheme $s.Sub $s.Id
+    $fmt = 'AC=' + $post.AC + '/DC=' + $post.DC
+    $bTxt = 'AC=' + $pre.AC + '/DC=' + $pre.DC
+    if ($cleared) { $bTxt = $bTxt + ' (hidden)' }
+    # a value the firmware will not read back is a SKIP, not a failure
+    if ($post.AC -eq $want -and ($post.DC -eq $want -or $null -eq $post.DC)) {
+      if ($s.Item -eq 'IDLEDISABLE' -and $guardNote.Length -gt 0) {
+        Add-PcbRow 'a' ('power/' + $s.Item) $bTxt $fmt ('OK (' + $guardNote + ')') | Out-Null
+      } else {
+        Add-PcbRow 'a' ('power/' + $s.Item) $bTxt $fmt 'OK' | Out-Null
+      }
+    } elseif ($rc.AC -ne 0 -or $post.AC -ne $want) {
+      if ($rc.AC -ne 0) {
+        Add-PcbRow 'a' ('power/' + $s.Item) $bTxt $fmt 'SKIP: not supported here' | Out-Null
+      } else {
+        Add-PcbRow 'a' ('power/' + $s.Item) $bTxt $fmt ('FAIL: read-back differs (rc ' + $rc.AC + '/' + $rc.DC + ')') | Out-Null
+      }
+    } else {
+      Add-PcbRow 'a' ('power/' + $s.Item) $bTxt $fmt 'OK' | Out-Null
+    }
+  }
+  $script:PcbState['Power'] = @{ BeforeGuid = $before; NewGuid = $script:PcbNewScheme; Unhidden = @($unhidden) }
+  Save-PcbState
+  & powercfg /setactive $script:PcbNewScheme 2>&1 | Out-Null
+  $after = Get-PcbActiveGuid
+  if ($after -eq $script:PcbNewScheme) {
+    Add-PcbRow 'a' 'power/scheme' $before $after ('OK (source ' + $srcNote + ')') | Out-Null
+  } else {
+    Add-PcbRow 'a' 'power/scheme' $before $after 'FAIL: setactive did not stick' | Out-Null
+  }
+}
+
+function Restore-PcbPower {
+  if ($script:PcbDryRun) { return }
+  $p = $script:PcbState['Power']
+  if ($null -eq $p) { return }
+  $before = $p.BeforeGuid
+  $new = $p.NewGuid
+  $cur = Get-PcbActiveGuid
+  $lst = @(Get-PcbSchemeList)
+  if ($before -and ($lst -contains $before) -and $cur -ne $before) {
+    & powercfg /setactive $before 2>&1 | Out-Null
+  }
+  if ($new -and (@(Get-PcbSchemeList) -contains $new)) {
+    $cur2 = Get-PcbActiveGuid
+    if ($cur2 -eq $new -and $before) { & powercfg /setactive $before 2>&1 | Out-Null }
+    & powercfg -delete $new 2>&1 | Out-Null
+  }
+  # put back the hide attribute on every setting the kit had to unhide
+  foreach ($u in @($p.Unhidden)) {
+    if ($null -eq $u) { continue }
+    try {
+      & powercfg -attributes ([string]$u.Sub) ([string]$u.Id) +ATTRIB_HIDE 2>&1 | Out-Null
+    } catch { }
+  }
+  Add-PcbRow 'r' 'power/scheme' $cur (Get-PcbActiveGuid) 'OK' | Out-Null
+}
+
+# ===========================================================================
+# step b - display
+# ===========================================================================
+
+function Get-PcbDisplays {
+  Initialize-PcbNative
+  $out = New-Object System.Collections.ArrayList
+  foreach ($line in @([PcbNative]::DisplayDevices())) {
+    $p = ([string]$line).Split('|')
+    if ($p.Count -lt 3) { continue }
+    $flags = 0
+    [void][int]::TryParse($p[2], [ref]$flags)
+    if (($flags -band 0x1) -eq 0) { continue }
+    [void]$out.Add([pscustomobject]@{ Device = $p[0]; Name = $p[1]; Flags = $flags })
+  }
+  return @($out)
+}
+
+function Get-PcbDisplayHz([string]$dev) {
+  Initialize-PcbNative
+  $cur = [PcbNative]::CurrentMode($dev)
+  if ($null -eq $cur) { return $null }
+  $p = ([string]$cur).Split('|')
+  return [pscustomobject]@{ W = [int]$p[0]; H = [int]$p[1]; Bpp = [int]$p[2]; Hz = [int]$p[3] }
+}
+
+function Get-PcbMaxHz([string]$dev, [int]$w, [int]$h, [int]$bpp) {
+  Initialize-PcbNative
+  $best = 0
+  foreach ($line in @([PcbNative]::AllModes($dev))) {
+    $p = ([string]$line).Split('|')
+    if ($p.Count -lt 4) { continue }
+    if ([int]$p[0] -ne $w -or [int]$p[1] -ne $h -or [int]$p[2] -ne $bpp) { continue }
+    if ([int]$p[3] -gt $best) { $best = [int]$p[3] }
+  }
+  return $best
+}
+
+function Invoke-PcbStepDisplay {
+  if ($NoDisplay) {
+    Add-PcbRow 'b' 'display' 'n/a' 'n/a' 'SKIP: -NoDisplay' | Out-Null
+    return
+  }
+  $recs = New-Object System.Collections.ArrayList
+  foreach ($d in @(Get-PcbDisplays)) {
+    $cur = Get-PcbDisplayHz $d.Device
+    if ($null -eq $cur) {
+      Add-PcbRow 'b' ('display/' + $d.Device) 'unknown' 'unknown' 'SKIP: current mode not readable' | Out-Null
+      continue
+    }
+    $rec = @{ Device = $d.Device; OldW = $cur.W; OldH = $cur.H; OldBpp = $cur.Bpp; OldHz = $cur.Hz; NewHz = $cur.Hz }
+    [void]$recs.Add($rec)
+    $max = Get-PcbMaxHz $d.Device $cur.W $cur.H $cur.Bpp
+    if ($max -le $cur.Hz) {
+      Add-PcbRow 'b' ('display/' + $d.Device) ($cur.Hz.ToString() + ' Hz') ($cur.Hz.ToString() + ' Hz') 'SKIP: already at max refresh' | Out-Null
+      continue
+    }
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'b' ('display/' + $d.Device) ($cur.Hz.ToString() + ' Hz') ($max.ToString() + ' Hz') 'DRYRUN' | Out-Null
+      continue
+    }
+    $rc = [PcbNative]::SetMode($d.Device, $cur.W, $cur.H, $cur.Bpp, $max)
+    $post = Get-PcbDisplayHz $d.Device
+    if ($rc -eq 0 -and $null -ne $post) {
+      $rec.NewHz = $post.Hz
+      Add-PcbRow 'b' ('display/' + $d.Device) ($cur.Hz.ToString() + ' Hz') ($post.Hz.ToString() + ' Hz') 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'b' ('display/' + $d.Device) ($cur.Hz.ToString() + ' Hz') ('rc=' + $rc) ('FAIL: ChangeDisplaySettingsEx rc ' + $rc) | Out-Null
+    }
+  }
+  $script:PcbState['Display'] = @($recs)
+  Save-PcbState
+}
+
+function Restore-PcbDisplay {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['Display']
+  if ($null -eq $recs) { return }
+  foreach ($r in @($recs)) {
+    $cur = Get-PcbDisplayHz $r.Device
+    if ($null -eq $cur) { continue }
+    if ($cur.Hz -eq [int]$r.OldHz) {
+      Add-PcbRow 'r' ('display/' + $r.Device) ($cur.Hz.ToString() + ' Hz') ($cur.Hz.ToString() + ' Hz') 'SKIP: already original' | Out-Null
+      continue
+    }
+    $rc = [PcbNative]::SetMode($r.Device, [int]$r.OldW, [int]$r.OldH, [int]$r.OldBpp, [int]$r.OldHz)
+    $post = Get-PcbDisplayHz $r.Device
+    $hz = 'n/a'
+    if ($null -ne $post) { $hz = $post.Hz.ToString() + ' Hz' }
+    if ($rc -eq 0) {
+      Add-PcbRow 'r' ('display/' + $r.Device) ($cur.Hz.ToString() + ' Hz') $hz 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'r' ('display/' + $r.Device) ($cur.Hz.ToString() + ' Hz') $hz ('FAIL: rc ' + $rc) | Out-Null
+    }
+  }
+}
+
+# ===========================================================================
+# step c - NIC
+# ===========================================================================
+
+$script:PcbNicKeywords = @(
+  '*InterruptModeration=0',
+  '*EEE=0',
+  '*FlowControl=0',
+  'EEELinkAdvertisement=0',
+  'AdvancedEEE=0',
+  'EnableGreenEthernet=0',
+  'GigaLite=0',
+  'PowerSavingMode=0',
+  'EnableConnectedPowerGating=0',
+  '*LsoV2IPv4=0',
+  '*LsoV2IPv6=0',
+  '*RscIPv4=0',
+  '*RscIPv6=0',
+  '*RSS=1',
+  '*NumRssQueues=4'
+)
+
+# The four bindings disabled on the home PC (p60.ps1:3, p61.ps1:3 and the W-INV2
+# re-sweep).  The QoS scheduler, NPCAP and the two Microsoft virtual drivers cost
+# per-packet work even when they see no match.
+$script:PcbNicBindings = @('ms_pacer', 'INSECURE_NPCAP', 'ms_l2bridge', 'ms_l1vhlwf')
+
+# netsh writes: only the ones that are live on the home PC (W-INV2: initialRto=300 holds,
+# the ctcp supplemental write did not - live provider is bbr2, so it is not shipped).
+# rsc is still listed because `netsh int tcp show global` at home reports it disabled.
+$script:PcbNetshCommands = @(
+  'int tcp set global rsc=disabled',
+  'int tcp set global initialRto=300'
+)
+
+# Injectable seams: a test replaces these so no real adapter is touched.
+$script:PcbNicAdapters = $null       # scriptblock -> adapter objects (Name, ...)
+$script:PcbNicPropGet = $null        # scriptblock (Name, Keyword) -> advanced property or $null
+$script:PcbNicPropSet = $null        # scriptblock (Name, Keyword, Value) -> $null
+$script:PcbNicBindGet = $null        # scriptblock (Name) -> binding records
+$script:PcbNicBindSet = $null        # scriptblock (Name, ComponentId, Enabled) -> $null
+$script:PcbNetshRun = $null          # scriptblock (ArgumentArray) -> @{ Output; Code }
+$script:PcbNicRestart = $null        # scriptblock (Name) -> $null
+$script:PcbQosAdd = $null            # scriptblock (Name) -> $null (throws on failure)
+$script:PcbQosGet = $null            # scriptblock (Name) -> policy object or $null
+$script:PcbQosRemove = $null         # scriptblock (Name) -> $null
+
+function Invoke-PcbNetsh([string[]]$Arguments) {
+  if ($null -ne $script:PcbNetshRun) {
+    $r = & $script:PcbNetshRun $Arguments
+    $out = ''
+    $code = 0
+    if ($null -ne $r) {
+      if ($r -is [hashtable] -or $r.PSObject.Properties['Output']) {
+        $out = [string]$r.Output
+        if ($null -ne $r.Code) { $code = [int]$r.Code }
+      } else { $out = [string]$r }
+    }
+    return [pscustomobject]@{ Output = $out; Code = $code }
+  }
+  $txt = ''
+  try {
+    $txt = (@(& netsh @Arguments 2>&1 | ForEach-Object { [string]$_ }) -join "`n")
+    $rc = $LASTEXITCODE
+  } catch {
+    return [pscustomobject]@{ Output = $_.Exception.Message; Code = -1 }
+  }
+  return [pscustomobject]@{ Output = $txt; Code = [int]$rc }
+}
+
+# 'Initial RTO                 : 300' -> @{ 'Initial RTO' = '300' }.  The labels are
+# localized on a Korean Windows, so the map is keyed by the label text as printed and the
+# before/after snapshots are compared as whole maps.
+function ConvertFrom-PcbNetshShow([string]$Text) {
+  $map = @{}
+  foreach ($ln in ([string]$Text).Split("`n")) {
+    $t = $ln.Trim()
+    if ($t.Length -eq 0) { continue }
+    $i = $t.IndexOf(':')
+    if ($i -le 0) { continue }
+    $k = $t.Substring(0, $i).Trim()
+    $v = $t.Substring($i + 1).Trim()
+    if ($k.Length -eq 0) { continue }
+    $map[$k] = $v
+  }
+  return $map
+}
+
+function Get-PcbNetshSnapshot {
+  $g = Invoke-PcbNetsh @('int', 'tcp', 'show', 'global')
+  $s = Invoke-PcbNetsh @('int', 'tcp', 'show', 'supplemental', 'template=internetcustom')
+  return [pscustomobject]@{
+    Global    = ConvertFrom-PcbNetshShow ([string]$g.Output)
+    Supplemental = ConvertFrom-PcbNetshShow ([string]$s.Output)
+  }
+}
+
+function Get-PcbNicList {
+  if ($null -ne $script:PcbNicAdapters) { return @(& $script:PcbNicAdapters) }
+  if (-not (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue)) { return @() }
+  try {
+    return @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' })
+  } catch { return @() }
+}
+
+function Get-PcbNicLabel($Adapter) {
+  # A Korean adapter alias ('??') becomes '???' once Write-PcbLine folds non-ASCII to
+  # '?', so a non-ASCII alias is replaced in the ROW LABEL by the driver description.
+  # The adapter Name is still what every cmdlet call and state.json use.
+  if ($null -eq $Adapter) { return '' }
+  $nm = [string]$Adapter.Name
+  if ($nm -match '[^\x20-\x7E]') {
+    $desc = ''
+    try { $desc = [string]$Adapter.InterfaceDescription } catch { $desc = '' }
+    if (-not [string]::IsNullOrWhiteSpace($desc)) { return $desc }
+  }
+  return $nm
+}
+
+function Get-PcbNicProp($Name, [string]$Keyword) {
+  if ($null -ne $script:PcbNicPropGet) { return (& $script:PcbNicPropGet $Name $Keyword) }
+  try {
+    return @(Get-NetAdapterAdvancedProperty -Name $Name -AllProperties -RegistryKeyword $Keyword -ErrorAction Stop)[0]
+  } catch { return $null }
+}
+
+function Set-PcbNicProp($Name, [string]$Keyword, [string]$Value) {
+  if ($null -ne $script:PcbNicPropSet) { & $script:PcbNicPropSet $Name $Keyword $Value; return }
+  Set-NetAdapterAdvancedProperty -Name $Name -RegistryKeyword $Keyword -RegistryValue $Value -NoRestart -ErrorAction Stop | Out-Null
+}
+
+function Get-PcbNicBindings($Name) {
+  if ($null -ne $script:PcbNicBindGet) { return @(& $script:PcbNicBindGet $Name) }
+  try { return @(Get-NetAdapterBinding -Name $Name -AllBindings -ErrorAction Stop) } catch { return @() }
+}
+
+function Set-PcbNicBinding($Name, [string]$ComponentId, [bool]$Enabled) {
+  if ($null -ne $script:PcbNicBindSet) { & $script:PcbNicBindSet $Name $ComponentId $Enabled; return }
+  if ($Enabled) {
+    Enable-NetAdapterBinding -Name $Name -ComponentID $ComponentId -ErrorAction Stop | Out-Null
+  } else {
+    Disable-NetAdapterBinding -Name $Name -ComponentID $ComponentId -ErrorAction Stop | Out-Null
+  }
+}
+
+# A NIC write only takes effect on the next adapter restart, and the restart drops the
+# link for a few seconds - which is exactly why a test must be able to replace it.
+function Restart-PcbNic([string]$Name) {
+  if ($null -ne $script:PcbNicRestart) { & $script:PcbNicRestart $Name; return }
+  Restart-NetAdapter -Name $Name -ErrorAction Stop | Out-Null
+}
+
+function Invoke-PcbStepNic {
+  param($Masks = $null)
+  if ($NoNic) {
+    Add-PcbRow 'c' 'nic' 'n/a' 'n/a' 'SKIP: -NoNic' | Out-Null
+    return
+  }
+  if ($null -eq $script:PcbNicAdapters -and -not (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'c' 'nic' 'n/a' 'n/a' 'SKIP: NetAdapter module not available' | Out-Null
+    return
+  }
+  $recs = New-Object System.Collections.ArrayList
+  foreach ($n in @(Get-PcbNicList)) {
+    $any = $false
+    $lbl = Get-PcbNicLabel $n
+    foreach ($spec in $script:PcbNicKeywords) {
+      $kv = $spec.Split('=')
+      $kw = $kv[0]
+      $want = $kv[1]
+      $prop = Get-PcbNicProp $n.Name $kw
+      if ($null -eq $prop) {
+        Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) 'absent' 'absent' 'SKIP: keyword not supported' | Out-Null
+        continue
+      }
+      # a keyword the driver exposes but does not let you pick this value
+      $valid = $null
+      if ($null -ne $prop.PSObject.Properties['ValidRegistryValues']) { $valid = @($prop.ValidRegistryValues) }
+      if ($null -ne $valid -and @($valid).Count -gt 0) {
+        $hit = $false
+        foreach ($v in @($valid)) { if ([string]$v -eq $want) { $hit = $true; break } }
+        if (-not $hit) {
+          Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) ([string]$prop.RegistryValue) ([string]$prop.RegistryValue) 'SKIP: value not offered' | Out-Null
+          continue
+        }
+      }
+      $old = [string]$prop.RegistryValue
+      if ($old -eq $want) {
+        Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) $old $old 'SKIP: already set' | Out-Null
+        continue
+      }
+      if ($script:PcbDryRun) {
+        Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) $old $want 'DRYRUN' | Out-Null
+        continue
+      }
+      try {
+        Set-PcbNicProp $n.Name $kw $want
+        $now = Get-PcbNicProp $n.Name $kw
+        [void]$recs.Add(@{ Name = $n.Name; Keyword = $kw; Old = $old })
+        $any = $true
+        $nowV = $want
+        if ($null -ne $now) { $nowV = [string]$now.RegistryValue }
+        $st = 'OK'
+        if ($nowV -ne $want) { $st = 'FAIL: read-back differs' }
+        Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) $old $nowV $st | Out-Null
+      } catch {
+        Add-PcbRow 'c' ('nic/' + $lbl + '/' + $kw) $old $want ('FAIL: ' + $_.Exception.Message) | Out-Null
+      }
+    }
+    $any = (Invoke-PcbNicBindings $n $lbl $recs) -or $any
+    if ($any -and -not $script:PcbDryRun) {
+      Write-PcbLine 'network drops ~5 s'
+      try { Restart-PcbNic $n.Name } catch {
+        Add-PcbRow 'c' ('nic/' + $lbl + '/restart') 'up' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+      }
+    }
+  }
+  $script:PcbState['Nic'] = @($recs)
+  Save-PcbState
+  Invoke-PcbNicNetsh
+  Invoke-PcbNicUdp
+}
+
+function Invoke-PcbNicBindings($Adapter, [string]$Label, $Recs) {
+  $any = $false
+  $bindings = @(Get-PcbNicBindings $Adapter.Name)
+  foreach ($cid in $script:PcbNicBindings) {
+    $item = 'nic/' + $Label + '/bind/' + $cid
+    $b = $null
+    foreach ($x in $bindings) { if ($null -ne $x -and [string]$x.ComponentID -eq $cid) { $b = $x; break } }
+    if ($null -eq $b) {
+      Add-PcbRow 'c' $item 'absent' 'absent' 'SKIP: binding not present' | Out-Null
+      continue
+    }
+    if (-not [bool]$b.Enabled) {
+      Add-PcbRow 'c' $item 'disabled' 'disabled' 'SKIP: already disabled' | Out-Null
+      continue
+    }
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'c' $item 'enabled' 'disabled' 'DRYRUN' | Out-Null
+      continue
+    }
+    try {
+      Set-PcbNicBinding $Adapter.Name $cid $false
+      $now = $null
+      foreach ($x in @(Get-PcbNicBindings $Adapter.Name)) { if ($null -ne $x -and [string]$x.ComponentID -eq $cid) { $now = $x; break } }
+      [void]$Recs.Add(@{ Name = $Adapter.Name; Binding = $cid })
+      $any = $true
+      $st = 'OK'
+      if ($null -ne $now -and [bool]$now.Enabled) { $st = 'FAIL: still enabled' }
+      Add-PcbRow 'c' $item 'enabled' 'disabled' $st | Out-Null
+    } catch {
+      Add-PcbRow 'c' $item 'enabled' 'disabled' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  return $any
+}
+
+# `netsh -c int tcp dump` prints the live configuration as one replayable
+# "set global a=b c=d ..." line.  That line is what revert replays, so the restore does
+# not have to guess a Windows default per knob and does not depend on localized labels.
+function Get-PcbNetshTcpDumpLine {
+  $r = Invoke-PcbNetsh @('-c', 'int', 'tcp', 'dump')
+  foreach ($ln in ([string]$r.Output).Split("`n")) {
+    $t = $ln.Trim()
+    if ($t -match '^set\s+global\s+\S') { return $t }
+  }
+  return ''
+}
+
+# 'set global rss=enabled ... rsc=disabled ...' -> @{ rsc = 'disabled' }  (lowercase keys)
+function ConvertFrom-PcbNetshSetLine([string]$Line) {
+  $map = @{}
+  $t = ([string]$Line).Trim()
+  if ($t -notmatch '^set\s+global\s+') { return $map }
+  foreach ($kv in ($t -replace '^set\s+global\s+', '').Split(' ')) {
+    $i = $kv.IndexOf('=')
+    if ($i -le 0) { continue }
+    $map[$kv.Substring(0, $i).ToLower()] = $kv.Substring($i + 1)
+  }
+  return $map
+}
+
+function Invoke-PcbNicNetsh {
+  $before = Get-PcbNetshSnapshot
+  $beforeLine = ''
+  try { $beforeLine = Get-PcbNetshTcpDumpLine } catch { $beforeLine = '' }
+  $beforeMap = ConvertFrom-PcbNetshSetLine $beforeLine
+  $applied = New-Object System.Collections.ArrayList
+  foreach ($cmd in $script:PcbNetshCommands) {
+    $item = 'netsh/' + $cmd
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'c' $item '(current)' '(set)' 'DRYRUN' | Out-Null
+      continue
+    }
+    $args2 = @($cmd.Split(' '))
+    $r = Invoke-PcbNetsh $args2
+    if ([int]$r.Code -ne 0) {
+      $msg = 'netsh rc ' + $r.Code
+      foreach ($ln in ([string]$r.Output).Split("`n")) { $t = $ln.Trim(); if ($t.Length -gt 0) { $msg = $t; break } }
+      Add-PcbRow 'c' $item '(current)' '(unchanged)' ('SKIP: ' + $msg) | Out-Null
+      continue
+    }
+    [void]$applied.Add($cmd)
+  }
+  if (-not $script:PcbDryRun -and $applied.Count -gt 0) {
+    # live read-back: the knob named in the command is looked up in the dump line after
+    # the write.  netsh prints 'Ok.' even when it ignores a value, so the read is the proof.
+    $afterLine = ''
+    try { $afterLine = Get-PcbNetshTcpDumpLine } catch { $afterLine = '' }
+    $afterMap = ConvertFrom-PcbNetshSetLine $afterLine
+    foreach ($cmd in @($applied)) {
+      $item = 'netsh/' + $cmd
+      $pair = @($cmd.Split(' ') | Where-Object { $_ -match '=' })
+      $want = ''
+      $got = ''
+      if (@($pair).Count -gt 0) {
+        $kv = ([string]$pair[0]).Split('=')
+        $want = [string]$kv[1]
+        if ($afterMap.ContainsKey($kv[0].ToLower())) { $got = [string]$afterMap[$kv[0].ToLower()] }
+      }
+      $bTxt = 'unread'
+      if (@($pair).Count -gt 0) {
+        $kv = ([string]$pair[0]).Split('=')
+        if ($beforeMap.ContainsKey($kv[0].ToLower())) { $bTxt = [string]$beforeMap[$kv[0].ToLower()] }
+      }
+      if ($want.Length -gt 0 -and $got -eq $want) {
+        Add-PcbRow 'c' $item $bTxt $got 'OK' | Out-Null
+      } else {
+        Add-PcbRow 'c' $item $bTxt $got 'OK (written)' | Out-Null
+      }
+    }
+    $script:PcbState['Netsh'] = @{ Before = $before; Applied = @($applied); DumpLine = $beforeLine }
+    Save-PcbState
+  }
+}
+
+# ---------------------------------------------------------------------------
+# step c - UDP: receive offload and the LoL DSCP mark (W-UDP1)
+# ---------------------------------------------------------------------------
+# URO: `netsh int udp set global uro=disabled` prints "Ok." whether or not anything
+# changed, so the only proof is a read of "Receive Offload State" out of
+# `netsh int udp show global`.  Read before, write, read after.
+$script:PcbUroRead = $null           # scriptblock -> state string ('enabled'/'disabled'/'')
+
+function Get-PcbUdpUroState {
+  if ($null -ne $script:PcbUroRead) { return ([string](& $script:PcbUroRead)).Trim() }
+  $r = Invoke-PcbNetsh @('int', 'udp', 'show', 'global')
+  # The label is localized on a Korean Windows, so the state is taken by position:
+  # the udp global block lists exactly two states and the first one is receive.
+  $states = New-Object System.Collections.ArrayList
+  foreach ($ln in ([string]$r.Output).Split("`n")) {
+    $t = $ln.Trim()
+    $i = $t.IndexOf(':')
+    if ($i -le 0) { continue }
+    $v = $t.Substring($i + 1).Trim()
+    if ($v -eq 'disabled' -or $v -eq 'enabled') { [void]$states.Add($v) }
+  }
+  if ($states.Count -gt 0) { return [string]$states[0] }
+  return ''
+}
+
+# DSCP 46 for LoL's UDP: an ActiveStore QoS policy marks the packets at once and is
+# gone again at the next boot (opus-recompute-tos.txt: a/b carry 0xb8 with the policy
+# up, c carries 0x0 once it is removed).  PersistentStore and the Tcpip\QoS key are
+# never written.
+$script:PcbQosPolicyName = 'pcbang-lol-udp'
+$script:PcbQosAppName = 'League of Legends.exe'
+
+function Get-PcbQosPolicy([string]$Name) {
+  if ($null -ne $script:PcbQosGet) { return (& $script:PcbQosGet $Name) }
+  try { return (Get-NetQosPolicy -PolicyStore ActiveStore -Name $Name -ErrorAction Stop) } catch { return $null }
+}
+
+function Add-PcbQosPolicy([string]$Name) {
+  if ($null -ne $script:PcbQosAdd) { & $script:PcbQosAdd $Name; return }
+  New-NetQosPolicy -Name $Name -PolicyStore ActiveStore -AppPathNameMatchCondition $script:PcbQosAppName -IPProtocolMatchCondition UDP -DSCPAction 46 -ErrorAction Stop | Out-Null
+}
+
+function Remove-PcbQosPolicy([string]$Name) {
+  if ($null -ne $script:PcbQosRemove) { & $script:PcbQosRemove $Name; return }
+  Remove-NetQosPolicy -Name $Name -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop | Out-Null
+}
+
+function Invoke-PcbNicUdp {
+  # $script:PcbState['Udp'] is written by the caller so a -DryRun leaves no trace.
+  $uroBefore = ''
+  try { $uroBefore = Get-PcbUdpUroState } catch { $uroBefore = '' }
+  $item = 'udp/uro'
+  if ($script:PcbDryRun) {
+    $b = 'unknown'
+    if ($uroBefore) { $b = $uroBefore }
+    Add-PcbRow 'c' $item $b 'disabled' 'DRYRUN' | Out-Null
+  } elseif ($uroBefore -eq 'disabled') {
+    Add-PcbRow 'c' $item 'disabled' 'disabled' 'SKIP: already disabled' | Out-Null
+  } elseif (-not $uroBefore) {
+    Add-PcbRow 'c' $item 'unknown' 'unknown' 'SKIP: state unreadable' | Out-Null
+  } else {
+    $r = Invoke-PcbNetsh @('int', 'udp', 'set', 'global', 'uro=disabled')
+    $now = ''
+    try { $now = Get-PcbUdpUroState } catch { $now = '' }
+    if ([int]$r.Code -eq 0 -and $now -eq 'disabled') {
+      $script:PcbState['Udp'] = @{ UroBefore = $uroBefore; UroWritten = $true }
+      Save-PcbState
+      Add-PcbRow 'c' $item $uroBefore $now 'OK' | Out-Null
+    } else {
+      $why = 'read-back ' + $now
+      if ([int]$r.Code -ne 0) { $why = 'rc ' + $r.Code + ' / ' + (Get-PcbNetshFirstLine $r.Output) }
+      Add-PcbRow 'c' $item $uroBefore $now ('SKIP: ' + $why) | Out-Null
+    }
+  }
+
+  $item = 'udp/dscp-lol'
+  $existing = $null
+  try { $existing = Get-PcbQosPolicy $script:PcbQosPolicyName } catch { $existing = $null }
+  if ($null -ne $existing) {
+    Add-PcbRow 'c' $item 'present' 'present' 'SKIP: policy already in ActiveStore' | Out-Null
+    return
+  }
+  if ($script:PcbDryRun) {
+    Add-PcbRow 'c' $item 'absent' 'DSCP 46 UDP' 'DRYRUN' | Out-Null
+    return
+  }
+  try {
+    Add-PcbQosPolicy $script:PcbQosPolicyName
+    $now = $null
+    try { $now = Get-PcbQosPolicy $script:PcbQosPolicyName } catch { $now = $null }
+    if ($null -ne $now) {
+      $txt = 'DSCP 46 UDP'
+      if ($null -ne $now.PSObject.Properties['DSCPAction']) { $txt = 'DSCP ' + [string]$now.DSCPAction + ' UDP' }
+      $u = $script:PcbState['Udp']
+      if ($null -eq $u) { $u = @{} }
+      $u['QosName'] = $script:PcbQosPolicyName
+      $script:PcbState['Udp'] = $u
+      Save-PcbState
+      Add-PcbRow 'c' $item 'absent' $txt 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'c' $item 'absent' 'DSCP 46 UDP' 'SKIP: policy not visible after add' | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'c' $item 'absent' 'DSCP 46 UDP' ('SKIP: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# Reverse order: the QoS policy first (it needs the driver path), then URO.
+function Restore-PcbNicUdp {
+  if ($script:PcbDryRun) { return }
+  $u = $script:PcbState['Udp']
+  if ($null -eq $u) { return }
+  $qosName = [string](Get-PcbStateField $u 'QosName')
+  if ($qosName) {
+    try {
+      Remove-PcbQosPolicy $qosName
+      $now = Get-PcbQosPolicy $qosName
+      $st = 'OK'
+      if ($null -ne $now) { $st = 'FAIL: policy still present' }
+      Add-PcbRow 'r' 'udp/dscp-lol' '(present)' 'absent' $st | Out-Null
+    } catch {
+      Add-PcbRow 'r' 'udp/dscp-lol' '(present)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  if ([bool](Get-PcbStateField $u 'UroWritten')) {
+    $want = [string](Get-PcbStateField $u 'UroBefore')
+    $r = Invoke-PcbNetsh @('int', 'udp', 'set', 'global', ('uro=' + $want))
+    $now = ''
+    try { $now = Get-PcbUdpUroState } catch { $now = '' }
+    $st = 'OK'
+    if ($now -ne $want) { $st = 'FAIL: read-back ' + $now }
+    if ([int]$r.Code -ne 0) { $st = 'FAIL: rc ' + $r.Code }
+    Add-PcbRow 'r' 'udp/uro' '(tuned)' $now $st | Out-Null
+  }
+}
+
+function Restore-PcbNic {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['Nic']
+  if ($null -eq $recs) { $recs = @() }
+  $touched = @{}
+  foreach ($r in @($recs)) {
+    if ($null -eq $r) { continue }
+    try {
+      if ($null -ne (Get-PcbStateField $r 'Binding')) {
+        Set-PcbNicBinding ([string]$r.Name) ([string]$r.Binding) $true
+        $touched[[string]$r.Name] = 1
+        Add-PcbRow 'r' ('nic/' + $r.Name + '/bind/' + [string]$r.Binding) 'disabled' 'enabled' 'OK' | Out-Null
+        continue
+      }
+      if ($null -ne (Get-PcbStateField $r 'Rss')) { continue }
+      Set-PcbNicProp ([string]$r.Name) ([string]$r.Keyword) ([string]$r.Old)
+      $touched[[string]$r.Name] = 1
+      Add-PcbRow 'r' ('nic/' + $r.Name + '/' + $r.Keyword) '(tuned)' $r.Old 'OK' | Out-Null
+    } catch {
+      Add-PcbRow 'r' ('nic/' + [string]$r.Name) '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  $ns = $script:PcbState['Netsh']
+  foreach ($cmd in @($script:PcbNetshCommands)) {
+    $item = 'netsh/' + $cmd
+    if ($null -eq $ns) {
+      Add-PcbRow 'r' $item '(tuned)' '(unchanged)' 'SKIP: kit did not write it' | Out-Null
+      continue
+    }
+    $did = $false
+    foreach ($a in @($ns.Applied)) { if ([string]$a -eq $cmd) { $did = $true; break } }
+    if (-not $did) {
+      Add-PcbRow 'r' $item '(tuned)' '(unchanged)' 'SKIP: kit did not write it' | Out-Null
+      continue
+    }
+    # the knobs this command wrote are looked up in the dump taken BEFORE the write and
+    # only those are put back; everything else netsh touched stays as it is now.
+    $inv = $null
+    $kvWant = @($cmd.Split(' ') | Where-Object { $_ -match '=' })
+    $savedLine = ''
+    $savedLine = [string](Get-PcbStateField $ns 'DumpLine')
+    $savedMap = ConvertFrom-PcbNetshSetLine $savedLine
+    $invParts = New-Object System.Collections.ArrayList
+    foreach ($p in @($kvWant)) {
+      $kv = ([string]$p).Split('=')
+      $key = $kv[0].ToLower()
+      if (-not $savedMap.ContainsKey($key)) { continue }
+      [void]$invParts.Add($kv[0] + '=' + [string]$savedMap[$key])
+    }
+    $good = ($invParts.Count -gt 0)
+    if ($good) {
+      $inv = @('int', 'tcp', 'set', 'global') + @($invParts.ToArray())
+    } else {
+      # no saved line (state written by an older kit): fall back to the Windows default
+      $inv = @($cmd.Split(' '))
+      if ($cmd -like '*rsc=disabled*') { $inv = @('int', 'tcp', 'set', 'global', 'rsc=enabled') }
+      if ($cmd -like '*initialRto=300*') { $inv = @('int', 'tcp', 'set', 'global', 'initialRto=1000') }
+    }
+    $r = Invoke-PcbNetsh $inv
+    if ([int]$r.Code -eq 0) {
+      $afterLine = ''
+      try { $afterLine = Get-PcbNetshTcpDumpLine } catch { $afterLine = '' }
+      $afterMap = ConvertFrom-PcbNetshSetLine $afterLine
+      $done = New-Object System.Collections.ArrayList
+      foreach ($p in @($invParts.ToArray())) {
+        $kv = ([string]$p).Split('=')
+        $got = '?'
+        if ($afterMap.ContainsKey($kv[0].ToLower())) { $got = [string]$afterMap[$kv[0].ToLower()] }
+        [void]$done.Add($kv[0] + '=' + $got)
+      }
+      $txt = 'restored ' + (@($done.ToArray()) -join ' ')
+      $st = 'OK'
+      if (@($done.ToArray()).Count -eq 0) { $txt = 'restored ' + ($inv -join ' ') }
+      Add-PcbRow 'r' $item '(tuned)' $txt $st | Out-Null
+    } else {
+      Add-PcbRow 'r' $item '(tuned)' 'unknown' ('FAIL: ' + (Get-PcbNetshFirstLine $r.Output)) | Out-Null
+    }
+  }
+  foreach ($k in @($touched.Keys)) {
+    Write-PcbLine 'network drops ~5 s'
+    try { Restart-PcbNic $k } catch { }
+  }
+}
+
+function Get-PcbNetshFirstLine([string]$Text) {
+  foreach ($ln in ([string]$Text).Split("`n")) { $t = $ln.Trim(); if ($t.Length -gt 0) { return $t } }
+  return 'no output'
+}
+
+# ===========================================================================
+# step c2 - IRQ pins (module from W-PCB3, optional)
+# ===========================================================================
+
+function Invoke-PcbStepIrq {
+  param($Masks)
+  if ($NoIrq) {
+    Add-PcbRow 'c2' 'irq' 'n/a' 'n/a' 'SKIP: -NoIrq' | Out-Null
+    return
+  }
+  if (-not (Get-Command Set-PcbIrqPins -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'c2' 'irq' 'n/a' 'n/a' 'SKIP: irq module absent' | Out-Null
+    return
+  }
+  # The GPU pin needs a restart of the display adapter before it takes effect.  That
+  # restart was measured on this PC (dxgkrnl ISR moved to CPU15 after pin 0x8000, GPU
+  # came back OK), so the gpu target is part of the default list.  -NoGpuIrq drops it
+  # and records a row saying so.  Only Role 'gpu' is dropped - the input controllers
+  # ('mouse-xhci', 'kbd-xhci') stay in the list.
+  $targets = $null
+  $gpuDropped = $null
+  if ($NoGpuIrq -and (Get-Command Get-PcbIrqTargets -ErrorAction SilentlyContinue)) {
+    try {
+      $all = @(Get-PcbIrqTargets)
+      $keep = New-Object System.Collections.ArrayList
+      foreach ($t in $all) {
+        if ($null -eq $t) { continue }
+        if ([string]$t.Role -eq 'gpu') { $gpuDropped = $t; continue }
+        [void]$keep.Add($t)
+      }
+      $targets = @($keep)
+    } catch {
+      $targets = $null
+      $gpuDropped = $null
+    }
+  }
+  try {
+    $sp = @{ IrqMask = $Masks.IrqMask; DryRun = [bool]$DryRun }
+    if ($null -ne $targets) { $sp['Targets'] = $targets }
+    $r = Set-PcbIrqPins @sp
+    if ($r) { $script:PcbState['Irq'] = $r.Before }
+    Save-PcbState
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      $st = [string]$row.Status
+      # dry-run rows from the irq module read 'OK (dry-run) cpu N'; the kit's row
+      # contract is DRYRUN for anything that would have changed, so normalise here and
+      # keep the chosen cpu visible in the Status column.
+      if ($script:PcbDryRun -and -not ($st -like 'SKIP*') -and -not ($st -like 'FAIL*')) {
+        $cpuTag = [regex]::Match($st, '(?i)\bcpu\s*([0-9]+)')
+        if ($cpuTag.Success) { $st = 'DRYRUN cpu ' + $cpuTag.Groups[1].Value } else { $st = 'DRYRUN' }
+      }
+      # W-PCB7B rows carry a Kind ('irq' | 'value' | 'restart') and a Detail column
+      # ('OK <value name>', 'msi=yes|no').  The kit's row shape has neither, so both go
+      # after the verdict: the kind in brackets (a value row would otherwise be
+      # indistinguishable from the pin row above it) and then the detail, so the msi
+      # verdict is not lost.  The verdict stays first because every row contract in this
+      # kit is read from the start of Status ('DRYRUN', 'SKIP: ...', 'FAIL: ...').
+      # Item/Before/After keep their columns - prefixing Item would truncate the id.
+      $kind = ''
+      if ($null -ne $row.PSObject.Properties['Step']) { $kind = [string]$row.Step }
+      $detail = ''
+      if ($null -ne $row.PSObject.Properties['Detail']) { $detail = ([string]$row.Detail).Trim() }
+      if ($kind) { $st = $st + ' [' + $kind + ']' }
+      if ($detail) { $st = $st + ' | ' + $detail }
+      Add-PcbRow 'c2' ([string]$row.Item) $row.Before $row.After $st | Out-Null
+    }
+    if (@($r.Rows).Count -eq 0) {
+      Add-PcbRow 'c2' 'irq' 'n/a' 'n/a' 'SKIP: module returned no targets' | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'c2' 'irq' 'n/a' 'n/a' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+  if ($null -ne $gpuDropped) {
+    $gid = [string]$gpuDropped.InstanceId
+    Add-PcbRow 'c2' ('gpu ' + $gid) 'unchanged' 'unchanged' 'SKIP: -NoGpuIrq' | Out-Null
+  }
+}
+
+function Restore-PcbIrq {
+  if ($script:PcbDryRun) { return }
+  $rec = $script:PcbState['Irq']
+  if ($null -eq $rec) { return }
+  if (-not (Get-Command Restore-PcbIrqPins -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'r' 'irq' 'n/a' 'n/a' 'SKIP: irq module absent' | Out-Null
+    return
+  }
+  try {
+    $r = Restore-PcbIrqPins -Before $rec
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      Add-PcbRow 'r' ([string]$row.Item) $row.Before $row.After ([string]$row.Status) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'r' 'irq' 'n/a' 'n/a' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# ===========================================================================
+# step d - registry
+# ===========================================================================
+
+function Get-PcbRegValue([string]$Path, [string]$Name) {
+  $rec = @{ Existed = $false; Value = $null; Kind = 'DWord' }
+  if (-not (Test-Path -LiteralPath $Path)) { return $rec }
+  $item = $null
+  try { $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop } catch { return $rec }
+  if ($null -eq $item) { return $rec }
+  $val = $null
+  try { $val = $item.$Name } catch { return $rec }
+  if ($null -eq $val) { return $rec }
+  $rec.Existed = $true
+  $rec.Value = $val
+  try { $rec.Kind = (Get-Item -LiteralPath $Path).GetValueKind($Name).ToString() } catch { }
+  return $rec
+}
+
+function Set-PcbRegValue([string]$Path, [string]$Name, [string]$Kind, $Value) {
+  if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+  if ($Kind -eq 'DWord') {
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([int]$Value) -PropertyType DWord -Force | Out-Null
+  } elseif ($Kind -eq 'String') {
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value ([string]$Value) -PropertyType String -Force | Out-Null
+  } else {
+    New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Force | Out-Null
+  }
+}
+
+function Get-PcbLolExe {
+  $yaml = 'C:\ProgramData\Riot Games\Metadata\league_of_legends.live\league_of_legends.live.product_settings.yaml'
+  $roots = New-Object System.Collections.ArrayList
+  if (Test-Path -LiteralPath $yaml) {
+    $txt = ''
+    try { $txt = Get-Content -LiteralPath $yaml -Raw -ErrorAction Stop } catch { $txt = '' }
+    $m = [regex]::Match($txt, 'product_install_full_path:\s*"?([^"\r\n]+)"?')
+    if ($m.Success) { [void]$roots.Add(($m.Groups[1].Value.Trim() -replace '/', '\')) }
+  }
+  [void]$roots.Add('C:\Riot Games\League of Legends')
+  [void]$roots.Add('D:\Riot Games\League of Legends')
+  foreach ($r in $roots) {
+    $exe = Join-Path $r 'Game\League of Legends.exe'
+    if (Test-Path -LiteralPath $exe) { return $exe }
+  }
+  return $null
+}
+
+function Get-PcbDxPrefsTarget {
+  # DirectXUserGlobalSettings is a REG_SZ of 'Key=Value;' pairs under UserGpuPreferences.
+  # Path/name are overridable so a test can drive a throw-away key.
+  $path = $script:PcbDxPath
+  if ([string]::IsNullOrWhiteSpace($path)) { $path = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences' }
+  $name = $script:PcbDxName
+  if ([string]::IsNullOrWhiteSpace($name)) { $name = 'DirectXUserGlobalSettings' }
+  return [pscustomobject]@{ Path = $path; Name = $name }
+}
+
+# Splits 'A=1;B=2;' into ordered pairs and a flag for a trailing semicolon.
+function ConvertFrom-PcbPairString([string]$text) {
+  $pairs = New-Object System.Collections.ArrayList
+  if ($null -eq $text) { return [pscustomobject]@{ Pairs = @(); Trailing = $false } }
+  $t = [string]$text
+  $trailing = $false
+  if ($t.Length -gt 0 -and $t.EndsWith(';')) { $trailing = $true }
+  foreach ($seg in $t.Split(';')) {
+    if ([string]::IsNullOrEmpty($seg)) { continue }
+    $eq = $seg.IndexOf('=')
+    if ($eq -lt 0) {
+      [void]$pairs.Add([pscustomobject]@{ Key = $seg; Value = $null })
+    } else {
+      [void]$pairs.Add([pscustomobject]@{ Key = $seg.Substring(0, $eq); Value = $seg.Substring($eq + 1) })
+    }
+  }
+  return [pscustomobject]@{ Pairs = @($pairs); Trailing = $trailing }
+}
+
+function Set-PcbPairValue([string]$text, [string]$key, [string]$value) {
+  # keeps every other pair and its order; an existing key is replaced in place.
+  $parsed = ConvertFrom-PcbPairString $text
+  $out = New-Object System.Collections.ArrayList
+  $done = $false
+  foreach ($p in @($parsed.Pairs)) {
+    if ([string]$p.Key -eq $key) {
+      if ($done) { continue }
+      [void]$out.Add($key + '=' + $value)
+      $done = $true
+      continue
+    }
+    if ($null -eq $p.Value) { [void]$out.Add([string]$p.Key) } else { [void]$out.Add([string]$p.Key + '=' + [string]$p.Value) }
+  }
+  if (-not $done) { [void]$out.Add($key + '=' + $value) }
+  if ($out.Count -eq 0) { return '' }
+  return (($out -join ';') + ';')
+}
+
+function Invoke-PcbStepDxPrefs {
+  $tgt = Get-PcbDxPrefsTarget
+  $item = 'dx/SwapEffectUpgradeEnable'
+  try {
+    $pre = Get-PcbRegValue $tgt.Path $tgt.Name
+    $before = 'absent'
+    if ($pre.Existed) { $before = [string]$pre.Value }
+    $old = $null
+    if ($pre.Existed) { $old = [string]$pre.Value }
+    $want = Set-PcbPairValue $old 'SwapEffectUpgradeEnable' '1'
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'd' $item $before $want 'DRYRUN' | Out-Null
+      return
+    }
+    Set-PcbRegValue $tgt.Path $tgt.Name 'String' $want
+    $post = Get-PcbRegValue $tgt.Path $tgt.Name
+    $after = 'absent'
+    if ($post.Existed) { $after = [string]$post.Value }
+    $script:PcbState['DxPrefs'] = @(@{ Path = $tgt.Path; Name = $tgt.Name; Existed = [bool]$pre.Existed; Value = $pre.Value })
+    Save-PcbState
+    if ($post.Existed -and [string]$post.Value -eq $want) {
+      Add-PcbRow 'd' $item $before $after 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'd' $item $before $after 'FAIL: write did not take' | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'd' $item 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbDxPrefs {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['DxPrefs']
+  if ($null -eq $recs) { return }
+  foreach ($r in @($recs)) {
+    $item = 'dx/SwapEffectUpgradeEnable'
+    try {
+      if ($r.Existed) {
+        Set-PcbRegValue ([string]$r.Path) ([string]$r.Name) 'String' ([string]$r.Value)
+        Add-PcbRow 'r' $item '(tuned)' ([string]$r.Value) 'OK' | Out-Null
+      } else {
+        if (Test-Path -LiteralPath ([string]$r.Path)) {
+          Remove-ItemProperty -LiteralPath ([string]$r.Path) -Name ([string]$r.Name) -ErrorAction SilentlyContinue
+        }
+        Add-PcbRow 'r' $item '(tuned)' 'absent' 'OK' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'r' $item '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+}
+
+function Invoke-PcbStepRegistry {
+  $rows = New-Object System.Collections.ArrayList
+  $targets = @(
+    @{ Item = 'PriorityControl/Win32PrioritySeparation'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl'; Name = 'Win32PrioritySeparation'; Kind = 'DWord'; Want = 0x26 },
+    @{ Item = 'GameConfigStore/GameDVR_Enabled';            Path = 'HKCU:\System\GameConfigStore'; Name = 'GameDVR_Enabled'; Kind = 'DWord'; Want = 0 },
+    @{ Item = 'GameDVR/AppCaptureEnabled';                  Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'; Name = 'AppCaptureEnabled'; Kind = 'DWord'; Want = 0 },
+    @{ Item = 'GameBar/AutoGameModeEnabled';                Path = 'HKCU:\Software\Microsoft\GameBar'; Name = 'AutoGameModeEnabled'; Kind = 'DWord'; Want = 1 },
+    @{ Item = 'GameBar/AllowAutoGameMode';                  Path = 'HKCU:\Software\Microsoft\GameBar'; Name = 'AllowAutoGameMode'; Kind = 'DWord'; Want = 1 }
+  )
+  # MMCSS (SystemProfile / Tasks\Games) is deliberately not here: mmcss.sys is a boot
+  # device driver, so its values are read once at boot and a write does nothing until the
+  # next restart.  Amendment 1 of W-PCB7A drops those rows.
+  $exe = Get-PcbLolExe
+  if ($exe) {
+    $targets += @{ Item = 'FSO/LoL'; Path = 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers'; Name = $exe; Kind = 'String'; Want = '~ DISABLEDXMAXIMIZEDWINDOWEDMODE' }
+  } else {
+    Add-PcbRow 'd' 'FSO/LoL' 'n/a' 'n/a' 'SKIP: League of Legends.exe not found' | Out-Null
+  }
+  foreach ($t in $targets) {
+    try {
+      $pre = Get-PcbRegValue $t.Path $t.Name
+      $bs = 'absent'
+      if ($pre.Existed) { $bs = [string]$pre.Value }
+      if ($script:PcbDryRun) {
+        Add-PcbRow 'd' $t.Item $bs ([string]$t.Want) 'DRYRUN' | Out-Null
+        continue
+      }
+      Set-PcbRegValue $t.Path $t.Name $t.Kind $t.Want
+      $post = Get-PcbRegValue $t.Path $t.Name
+      $as = 'absent'
+      if ($post.Existed) { $as = [string]$post.Value }
+      [void]$rows.Add(@{ Path = $t.Path; Name = $t.Name; Kind = $t.Kind; Existed = $pre.Existed; Value = $pre.Value })
+      if ([string]$post.Value -eq [string]$t.Want) {
+        Add-PcbRow 'd' $t.Item $bs $as 'OK' | Out-Null
+      } else {
+        Add-PcbRow 'd' $t.Item $bs $as 'FAIL: write did not take' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'd' $t.Item 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  $script:PcbState['Registry'] = @($rows)
+  Save-PcbState
+  Invoke-PcbStepDxPrefs
+  Invoke-PcbStepLolGpuPref
+}
+
+# The home state sets GpuPreference=2 (high performance) for the game exe.  The value is
+# one 'Key=Value;' pair inside a REG_SZ named after the exe's full path, so it is merged
+# like DirectXUserGlobalSettings: every other pair and the old string are preserved.
+$script:PcbGpuPrefPath = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
+
+function Invoke-PcbStepLolGpuPref {
+  $item = 'dx/LoL-GpuPreference'
+  $exe = Get-PcbLolExe
+  if (-not $exe) {
+    Add-PcbRow 'd' $item 'n/a' 'n/a' 'SKIP: League of Legends.exe not found' | Out-Null
+    return
+  }
+  try {
+    $pre = Get-PcbRegValue $script:PcbGpuPrefPath $exe
+    $before = 'absent'
+    if ($pre.Existed) { $before = [string]$pre.Value }
+    $old = $null
+    if ($pre.Existed) { $old = [string]$pre.Value }
+    $want = Set-PcbPairValue $old 'GpuPreference' '2'
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'd' $item $before $want 'DRYRUN' | Out-Null
+      return
+    }
+    Set-PcbRegValue $script:PcbGpuPrefPath $exe 'String' $want
+    $post = Get-PcbRegValue $script:PcbGpuPrefPath $exe
+    $after = 'absent'
+    if ($post.Existed) { $after = [string]$post.Value }
+    $recs = @($script:PcbState['GpuPref'])
+    $recs += @{ Path = $script:PcbGpuPrefPath; Name = $exe; Existed = [bool]$pre.Existed; Value = $pre.Value }
+    $script:PcbState['GpuPref'] = @($recs)
+    Save-PcbState
+    if ($post.Existed -and [string]$post.Value -eq $want) {
+      Add-PcbRow 'd' $item $before $after 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'd' $item $before $after 'FAIL: write did not take' | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'd' $item 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbGpuPref {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['GpuPref']
+  if ($null -eq $recs) { return }
+  foreach ($r in @($recs)) {
+    $item = 'dx/LoL-GpuPreference'
+    try {
+      if ([bool]$r.Existed) {
+        Set-PcbRegValue ([string]$r.Path) ([string]$r.Name) 'String' ([string]$r.Value)
+        Add-PcbRow 'r' $item '(tuned)' ([string]$r.Value) 'OK' | Out-Null
+      } else {
+        if (Test-Path -LiteralPath ([string]$r.Path)) {
+          Remove-ItemProperty -LiteralPath ([string]$r.Path) -Name ([string]$r.Name) -ErrorAction SilentlyContinue
+        }
+        Add-PcbRow 'r' $item '(tuned)' 'absent' 'OK' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'r' $item '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+}
+
+function Restore-PcbRegistry {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['Registry']
+  if ($null -eq $recs) { return }
+  foreach ($r in @($recs)) {
+    try {
+      if ($r.Existed) {
+        Set-PcbRegValue $r.Path $r.Name $r.Kind $r.Value
+        Add-PcbRow 'r' ('reg/' + $r.Name) '(tuned)' ([string]$r.Value) 'OK' | Out-Null
+      } else {
+        if (Test-Path -LiteralPath $r.Path) {
+          Remove-ItemProperty -LiteralPath $r.Path -Name $r.Name -ErrorAction SilentlyContinue
+        }
+        Add-PcbRow 'r' ('reg/' + $r.Name) '(tuned)' 'absent' 'OK' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'r' ('reg/' + $r.Name) '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+}
+
+# ===========================================================================
+# step e - mouse
+# ===========================================================================
+
+function Invoke-PcbStepMouse {
+  Initialize-PcbNative
+  $accel = $null
+  try { $accel = [PcbNative]::GetMouseAccel() } catch { $accel = $null }
+  $speed = -1
+  try { $speed = [PcbNative]::GetMouseSpeed() } catch { $speed = -1 }
+  if ($null -eq $accel -or $speed -lt 0) {
+    Add-PcbRow 'e' 'mouse' 'unknown' 'unknown' 'SKIP: SPI read failed' | Out-Null
+    return
+  }
+  $script:PcbState['Mouse'] = @{ Accel = @($accel); Speed = $speed }
+  Save-PcbState
+  $before = ('accel=' + ($accel -join ',') + ' speed=' + $speed)
+  if ($script:PcbDryRun) {
+    Add-PcbRow 'e' 'mouse' $before 'accel=0,0,0 speed=10' 'DRYRUN' | Out-Null
+    return
+  }
+  $ok1 = $false
+  $ok2 = $false
+  try { $ok1 = [PcbNative]::SetMouseAccel(0, 0, 0) } catch { $ok1 = $false }
+  try { $ok2 = [PcbNative]::SetMouseSpeed(10) } catch { $ok2 = $false }
+  $a2 = [PcbNative]::GetMouseAccel()
+  $s2 = [PcbNative]::GetMouseSpeed()
+  $after = ('accel=' + ($a2 -join ',') + ' speed=' + $s2)
+  # The read-back is the proof: a setter can return FALSE when the value is already in
+  # place (SPI_SETMOUSESPEED refuses a no-op from a non-interactive context), so the row
+  # is only a FAIL when the read-back is still off the target.
+  $atTarget = ((($a2 -join ',') -eq '0,0,0') -and ([int]$s2 -eq 10))
+  if ($atTarget) {
+    Add-PcbRow 'e' 'mouse' $before $after 'OK' | Out-Null
+  } elseif ($ok1 -and $ok2) {
+    Add-PcbRow 'e' 'mouse' $before $after 'OK (written)' | Out-Null
+  } else {
+    Add-PcbRow 'e' 'mouse' $before $after ('FAIL: set ret ' + $ok1 + '/' + $ok2) | Out-Null
+  }
+}
+
+function Restore-PcbMouse {
+  if ($script:PcbDryRun) { return }
+  $m = $script:PcbState['Mouse']
+  if ($null -eq $m) { return }
+  try {
+    $a = @($m.Accel)
+    [void][PcbNative]::SetMouseAccel([int]$a[0], [int]$a[1], [int]$a[2])
+    if ([int]$m.Speed -gt 0) { [void][PcbNative]::SetMouseSpeed([int]$m.Speed) }
+    $a2 = [PcbNative]::GetMouseAccel()
+    $s2 = [PcbNative]::GetMouseSpeed()
+    Add-PcbRow 'r' 'mouse' '(tuned)' ('accel=' + ($a2 -join ',') + ' speed=' + $s2) 'OK' | Out-Null
+  } catch {
+    Add-PcbRow 'r' 'mouse' '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# ===========================================================================
+# step f - services
+# ===========================================================================
+
+# The full home stop-only list (gaming-mode-apply.ps1:30-34) plus the NVIDIA container
+# service nv-final.ps1 stops.  Behaviour is unchanged from earlier kits: stop only, never
+# change StartType, and revert starts exactly the ones this run stopped.
+$script:PcbServiceNames = @(
+  'SysMain', 'WSearch', 'wuauserv', 'DoSvc', 'DiagTrack', 'dmwappushservice',
+  'WpnService', 'CDPSvc', 'MapsBroker', 'RetailDemo', 'WalletService',
+  'XblAuthManager', 'XblGameSave', 'XboxNetApiSvc', 'XboxGipSvc',
+  'Fax', 'RemoteRegistry', 'WMPNetworkSvc', 'stisvc', 'WerSvc',
+  'NvContainerLocalSystem'
+)
+
+function Invoke-PcbStepServices {
+  $stopped = New-Object System.Collections.ArrayList
+  foreach ($n in $script:PcbServiceNames) {
+    $svc = $null
+    try { $svc = Get-Service -Name $n -ErrorAction Stop } catch { $svc = $null }
+    if ($null -eq $svc) {
+      Add-PcbRow 'f' ('service/' + $n) 'absent' 'absent' 'SKIP: service not present' | Out-Null
+      continue
+    }
+    if ($svc.Status -ne 'Running') {
+      Add-PcbRow 'f' ('service/' + $n) ([string]$svc.Status) ([string]$svc.Status) ('SKIP: not running (StartType ' + $svc.StartType + ')') | Out-Null
+      continue
+    }
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'f' ('service/' + $n) 'Running' 'Stopped' 'DRYRUN' | Out-Null
+      continue
+    }
+    try {
+      Stop-Service -Name $n -Force -ErrorAction Stop
+      Start-Sleep -Milliseconds 300
+      $now = Get-Service -Name $n
+      [void]$stopped.Add($n)
+      Add-PcbRow 'f' ('service/' + $n) 'Running' ([string]$now.Status) 'OK' | Out-Null
+    } catch {
+      Add-PcbRow 'f' ('service/' + $n) 'Running' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  $script:PcbState['Services'] = @($stopped)
+  Save-PcbState
+}
+
+function Restore-PcbServices {
+  if ($script:PcbDryRun) { return }
+  $names = $script:PcbState['Services']
+  if ($null -eq $names) { return }
+  foreach ($n in @($names)) {
+    try {
+      Start-Service -Name $n -ErrorAction Stop
+      Add-PcbRow 'r' ('service/' + $n) 'Stopped' ([string](Get-Service -Name $n).Status) 'OK' | Out-Null
+    } catch {
+      Add-PcbRow 'r' ('service/' + $n) 'Stopped' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+}
+
+# ===========================================================================
+# step f2 - scheduled tasks (maintenance + NVIDIA updater)
+# ===========================================================================
+#
+# gaming-mode-apply.ps1:50-58 disables nine maintenance tasks in the home Gaming boot and
+# nv-final.ps1:44-50 disables every Nv* task.  Both are handled the same way: disable the
+# ones that are present AND enabled, record TaskPath+TaskName, and on revert enable only
+# those.  Nothing here re-enables a task that was already disabled before the kit ran.
+
+$script:PcbTaskPaths = @(
+  '\Microsoft\Windows\Defrag\ScheduledDefrag',
+  '\Microsoft\Windows\DiskFootprint\Diagnostics',
+  '\Microsoft\Windows\DiskFootprint\StorageSense',
+  '\Microsoft\Windows\Maintenance\WinSAT',
+  '\Microsoft\Windows\Application Experience\StartupAppTask',
+  '\Microsoft\Windows\Application Experience\ProgramDataUpdater',
+  '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator',
+  '\Microsoft\Windows\Feedback\Siuf\DmClient',
+  '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload'
+)
+
+function Invoke-PcbStepTasks {
+  $recs = New-Object System.Collections.ArrayList
+  if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'f2' 'task' 'n/a' 'n/a' 'SKIP: ScheduledTasks module not available' | Out-Null
+    return
+  }
+  $list = New-Object System.Collections.ArrayList
+  foreach ($p in $script:PcbTaskPaths) {
+    $tp = Split-Path -Parent $p
+    $tn = Split-Path -Leaf $p
+    if ([string]::IsNullOrEmpty($tp)) { $tp = '\' }
+    [void]$list.Add([pscustomobject]@{ Path = $tp; Name = $tn })
+  }
+  try {
+    foreach ($t in @(Get-ScheduledTask -TaskName 'Nv*' -ErrorAction SilentlyContinue)) {
+      if ($null -eq $t) { continue }
+      [void]$list.Add([pscustomobject]@{ Path = [string]$t.TaskPath; Name = [string]$t.TaskName })
+    }
+  } catch { }
+  foreach ($t in $list) {
+    $item = 'task/' + $t.Name
+    $tk = $null
+    try { $tk = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop } catch { $tk = $null }
+    if ($null -eq $tk) {
+      Add-PcbRow 'f2' $item 'absent' 'absent' 'SKIP: task not present' | Out-Null
+      continue
+    }
+    if ([string]$tk.State -eq 'Disabled') {
+      Add-PcbRow 'f2' $item 'Disabled' 'Disabled' 'SKIP: already disabled' | Out-Null
+      continue
+    }
+    if ($script:PcbDryRun) {
+      Add-PcbRow 'f2' $item ([string]$tk.State) 'Disabled' 'DRYRUN' | Out-Null
+      continue
+    }
+    try {
+      Disable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null
+      $now = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop
+      [void]$recs.Add(@{ Path = [string]$t.Path; Name = [string]$t.Name })
+      if ([string]$now.State -eq 'Disabled') {
+        Add-PcbRow 'f2' $item ([string]$tk.State) 'Disabled' 'OK' | Out-Null
+      } else {
+        Add-PcbRow 'f2' $item ([string]$tk.State) ([string]$now.State) 'FAIL: still enabled' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'f2' $item ([string]$tk.State) 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  $script:PcbState['Tasks'] = @($recs)
+  Save-PcbState
+}
+
+function Restore-PcbTasks {
+  if ($script:PcbDryRun) { return }
+  $recs = $script:PcbState['Tasks']
+  if ($null -eq $recs) { return }
+  foreach ($r in @($recs)) {
+    $item = 'task/' + [string]$r.Name
+    try {
+      Enable-ScheduledTask -TaskPath ([string]$r.Path) -TaskName ([string]$r.Name) -ErrorAction Stop | Out-Null
+      $now = Get-ScheduledTask -TaskPath ([string]$r.Path) -TaskName ([string]$r.Name) -ErrorAction Stop
+      Add-PcbRow 'r' $item 'Disabled' ([string]$now.State) 'OK' | Out-Null
+    } catch {
+      Add-PcbRow 'r' $item 'Disabled' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+}
+
+# ===========================================================================
+# step g - NVIDIA (module from W-PCB2, optional)
+# ===========================================================================
+
+function Invoke-PcbStepNvidia {
+  if (-not (Get-Command Set-PcbNvLol -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'g' 'nvidia' 'n/a' 'n/a' 'SKIP: nvidia module absent' | Out-Null
+    return
+  }
+  if ($script:PcbDryRun) {
+    # read-only: show every DRS setting of the plan (all rows of the module's table),
+    # never open a write session
+    $specs = @()
+    if ($null -ne $script:PcbNvLolSettings) { $specs = @($script:PcbNvLolSettings) }
+    $planParts = New-Object System.Collections.ArrayList
+    foreach ($spec in $specs) { [void]$planParts.Add($spec.Symbol + '=' + [uint32]$spec.Target) }
+    $plan = [string]@($specs).Count + ' settings (' + ($planParts -join ' ') + ')'
+    $cur = '(unchanged)'
+    try {
+      if (Get-Command Get-PcbNvLolState -ErrorAction SilentlyContinue) {
+        $st = Get-PcbNvLolState
+        $parts = New-Object System.Collections.ArrayList
+        if ($null -ne $st -and $st.PSObject.Properties['Settings']) {
+          foreach ($spec in $specs) {
+            $hit = $null
+            foreach ($e in @($st.Settings)) { if ($null -ne $e -and [uint32]$e.Id -eq [uint32]$spec.Id) { $hit = $e; break } }
+            if ($null -eq $hit) { [void]$parts.Add($spec.Symbol + '=<missing>') } else { [void]$parts.Add($spec.Symbol + '=' + [uint32]$hit.Value) }
+          }
+          if ($parts.Count -gt 0) { $cur = ($parts -join ' ') }
+        }
+      }
+    } catch { $cur = '(unchanged)' }
+    Add-PcbRow 'g' 'nvidia/profile' $cur $plan 'DRYRUN' | Out-Null
+    return
+  }
+  try {
+    $r = Set-PcbNvLol
+    if ($null -ne $r -and $r.PSObject.Properties['Before']) { $script:PcbState['Nvidia'] = $r.Before }
+    Save-PcbState
+    $prof = 'n/a'
+    if ($null -ne $r -and $r.PSObject.Properties['Before'] -and $null -ne $r.Before) { $prof = [string]$r.Before.Profile }
+    if ($null -ne $r -and $r.Ok) {
+      Add-PcbRow 'g' 'nvidia/profile' $prof ('applied: ' + $prof) 'OK' | Out-Null
+    } else {
+      $msg = 'unknown'
+      if ($null -ne $r -and $r.PSObject.Properties['Error']) { $msg = [string]$r.Error }
+      Add-PcbRow 'g' 'nvidia/profile' $prof 'unchanged' ('FAIL: ' + $msg) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'g' 'nvidia/profile' 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbNvidia {
+  if ($script:PcbDryRun) { return }
+  $n = $script:PcbState['Nvidia']
+  if ($null -eq $n) { return }
+  if (-not (Get-Command Restore-PcbNvLol -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'r' 'nvidia/profile' 'n/a' 'n/a' 'SKIP: nvidia module absent' | Out-Null
+    return
+  }
+  try {
+    $r = Restore-PcbNvLol -Before $n
+    if ($null -ne $r -and $r.Ok) {
+      Add-PcbRow 'r' 'nvidia/profile' '(tuned)' 'restored' 'OK' | Out-Null
+    } else {
+      $msg = 'unknown'
+      if ($null -ne $r -and $r.PSObject.Properties['Error']) { $msg = [string]$r.Error }
+      Add-PcbRow 'r' 'nvidia/profile' '(tuned)' 'unknown' ('FAIL: ' + $msg) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'r' 'nvidia/profile' '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# ===========================================================================
+# step g2 - GPU clocks (module from W-PCB7A, optional)
+# ===========================================================================
+#
+# The home PC raises the power limit and locks the clocks with nvidia-smi.  Everything
+# here is read back live with `nvidia-smi --query-gpu`, so a command the driver refused
+# is a SKIP row carrying the driver's own words, never a silent OK.
+
+function Invoke-PcbStepGpuClock {
+  if (-not (Get-Command Set-PcbGpuClock -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'g' 'gpu/clock' 'n/a' 'n/a' 'SKIP: gpuclock module absent' | Out-Null
+    return
+  }
+  try {
+    $st = Get-PcbGpuClockState
+    if ($null -eq $st -or -not $st.Available) {
+      $msg = 'nvidia-smi not found'
+      if ($null -ne $st -and -not [string]::IsNullOrWhiteSpace([string]$st.Error)) { $msg = [string]$st.Error }
+      Add-PcbRow 'g' 'gpu/clock' 'n/a' 'n/a' ('SKIP: ' + $msg) | Out-Null
+      return
+    }
+    if ($script:PcbDryRun) {
+      $b = $st.Before
+      $fmt = [System.Globalization.CultureInfo]::InvariantCulture
+      $plan = 'pl=' + [string]::Format($fmt, '{0:0.##}', [double]$b.MaxLimit) + ' lgc=' + [string]::Format($fmt, '{0:0}', [double]$b.MaxGraphics) + ' lmc=' + [string]::Format($fmt, '{0:0}', [double]$b.MaxMemory) + ' ac=' + [string]::Format($fmt, '{0:0}', [double]$b.MaxMemory) + '/' + [string]::Format($fmt, '{0:0}', [double]$b.MaxGraphics)
+      $cur = 'pl=' + (Format-PcbNvNum $b.PowerLimit '') + ' gr=' + (Format-PcbNvNum $b.MaxGraphics '')
+      Add-PcbRow 'g' 'gpu/clock' $cur $plan 'DRYRUN' | Out-Null
+      return
+    }
+    $r = Set-PcbGpuClock -State $st
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      Add-PcbRow 'g' ([string]$row.Item) $row.Before $row.After ([string]$row.Status) | Out-Null
+    }
+    if ($null -ne $r.Applied) {
+      $a = $r.Applied
+      $script:PcbState['GpuClock'] = @{ PowerLimit = $a.PowerLimit; LockedGfx = [bool]$a.LockedGfx; LockedMem = [bool]$a.LockedMem; AppClocks = [bool]$a.AppClocks }
+      Save-PcbState
+    }
+  } catch {
+    Add-PcbRow 'g' 'gpu/clock' 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbGpuClockStep {
+  if ($script:PcbDryRun) { return }
+  $rec = $script:PcbState['GpuClock']
+  if ($null -eq $rec) { return }
+  if (-not (Get-Command Restore-PcbGpuClock -ErrorAction SilentlyContinue -CommandType Function)) {
+    Add-PcbRow 'r' 'gpu/clock' 'n/a' 'n/a' 'SKIP: gpuclock module absent' | Out-Null
+    return
+  }
+  try {
+    $r = Restore-PcbGpuClock -Rec $rec
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      Add-PcbRow 'r' ([string]$row.Item) $row.Before $row.After ([string]$row.Status) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'r' 'gpu/clock' '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# ===========================================================================
+# step d2 - League of Legends config files (module from W-PCB7A, optional)
+# ===========================================================================
+#
+# game.cfg and PersistedSettings.json carry the same latency keys.  Both files are backed
+# up into StateDir before the write and restored byte-identically from that backup.
+
+function Invoke-PcbStepLolCfg {
+  if (-not (Get-Command Set-PcbLolCfg -ErrorAction SilentlyContinue)) {
+    Add-PcbRow 'd2' 'lol/cfg' 'n/a' 'n/a' 'SKIP: lolcfg module absent' | Out-Null
+    return
+  }
+  try {
+    $st = Get-PcbLolCfgState
+    if ($null -eq $st -or -not [bool]$st.Available) {
+      $msg = 'config not found'
+      if ($null -ne $st -and -not [string]::IsNullOrWhiteSpace([string]$st.Error)) { $msg = [string]$st.Error }
+      Add-PcbRow 'd2' 'lol/cfg' 'n/a' 'n/a' ('SKIP: ' + $msg) | Out-Null
+      return
+    }
+    if ($script:PcbDryRun) {
+      foreach ($spec in @($script:PcbLolCfgValues)) {
+        $before = '(absent)'
+        foreach ($r in @($st.Rows)) {
+          if ($null -eq $r) { continue }
+          if (([string]$r.Section + '/' + [string]$r.Name) -eq ([string]$spec.Section + '/' + [string]$spec.Name)) { $before = [string]$r.Before }
+        }
+        Add-PcbRow 'd2' ('lol/' + $spec.Section + '/' + $spec.Name) $before ([string]$spec.Value) 'DRYRUN' | Out-Null
+      }
+      return
+    }
+    $r = Set-PcbLolCfg -State $st
+    # Restore needs both halves: Backup (where the byte copies are) and Applied (which of
+    # them the kit actually rewrote).  Storing Backup alone makes revert skip both files.
+    if ($null -ne $r -and $r.PSObject.Properties['Backup']) {
+      $script:PcbState['LolCfg'] = [pscustomobject]@{ Backup = $r.Backup; Applied = $r.Applied }
+      Save-PcbState
+    }
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      Add-PcbRow 'd2' ([string]$row.Item) $row.Before $row.After ([string]$row.Status) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'd2' 'lol/cfg' 'unknown' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbLolCfgStep {
+  if ($script:PcbDryRun) { return }
+  $rec = $script:PcbState['LolCfg']
+  if ($null -eq $rec) { return }
+  if (-not (Get-Command Restore-PcbLolCfg -ErrorAction SilentlyContinue -CommandType Function)) {
+    Add-PcbRow 'r' 'lol/cfg' 'n/a' 'n/a' 'SKIP: lolcfg module absent' | Out-Null
+    return
+  }
+  try {
+    $r = Restore-PcbLolCfg -Rec $rec
+    foreach ($row in @($r.Rows)) {
+      if ($null -eq $row) { continue }
+      Add-PcbRow 'r' ([string]$row.Item) $row.Before $row.After ([string]$row.Status) | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'r' 'lol/cfg' '(tuned)' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+# ===========================================================================
+# step h - watcher
+# ===========================================================================
+
+function Write-PcbWLog([string]$Line) {
+  try {
+    $p = Join-Path $StateDir 'watcher.log'
+    Add-Content -LiteralPath $p -Value ((Get-Date -Format s) + ' ' + $Line) -ErrorAction Stop
+  } catch { }
+}
+
+function Invoke-PcbWatcherLoop {
+  $mutex = $null
+  try { $mutex = New-Object System.Threading.Mutex($false, 'Global\pcbang-watcher') } catch { $mutex = $null }
+  if ($null -ne $mutex) {
+    $got = $false
+    try { $got = $mutex.WaitOne(0) } catch { $got = $false }
+    if (-not $got) { return }
+  }
+  # The 0.507 ms timer is the core home fix, and a plain process loses it to power
+  # throttling.  Opting out of PROCESS_POWER_THROTTLING_EXECUTION_SPEED (and of the
+  # timer-resolution ignore) before the request is what makes Windows 11 honour it.
+  if (Get-Command Start-PcbTimerHold -ErrorAction SilentlyContinue) {
+    try {
+      $h = Start-PcbTimerHold -Resolution 5070
+      Write-PcbWLog ('timer ' + (Format-PcbTimerMs ([int]$h.Current)) + ' held (asked 5070, min ' + [string]$h.Min + ' max ' + [string]$h.Max + ', throttle-opt-out=' + [string]$h.ThrottleOptOut + ')')
+    } catch {
+      Write-PcbWLog ('timer hold FAIL ' + $_.Exception.Message)
+    }
+  } else {
+    Write-PcbWLog 'timer module absent'
+  }
+  $cfg = $null
+  $cfgPath = Join-Path $StateDir 'watcher.json'
+  if (Test-Path -LiteralPath $cfgPath) {
+    try { $cfg = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json } catch { $cfg = $null }
+  }
+  $gName = $GameName
+  $gMask = $GameMask
+  $sMask = $SideMask
+  $sNames = @($SideNames)
+  $pNames = @($ParentNames)
+  if ($null -ne $cfg) {
+    if ($cfg.PSObject.Properties['GameName']) { $gName = [string]$cfg.GameName }
+    if ($cfg.PSObject.Properties['GameMask']) { $gMask = [uint64]$cfg.GameMask }
+    if ($cfg.PSObject.Properties['SideMask']) { $sMask = [uint64]$cfg.SideMask }
+    if ($cfg.PSObject.Properties['SideNames']) { $sNames = @($cfg.SideNames) }
+    if ($cfg.PSObject.Properties['ParentNames']) { $pNames = @($cfg.ParentNames) }
+  }
+  $gameAff = [IntPtr][int64]$gMask
+  $sideAff = [IntPtr][int64]$sMask
+  Write-PcbWLog ('watcher start pid ' + $PID + ' game=' + (Format-PcbMask $gMask) + ' side=' + (Format-PcbMask $sMask))
+  $seen = @{}
+  while ($true) {
+    # parents first: the game is born with its parent's affinity, so the launcher has to
+    # be on the game mask before it spawns the game.  Priority is left alone here.
+    foreach ($q in @(Get-Process -Name $pNames -ErrorAction SilentlyContinue)) {
+      if (-not $q) { continue }
+      $curAff = $null
+      try { $curAff = $q.ProcessorAffinity } catch { continue }
+      if ($curAff -eq $gameAff) { continue }
+      try {
+        $q.ProcessorAffinity = $gameAff
+        Write-PcbWLog ('parent pid ' + $q.Id + ' ' + $q.ProcessName + ' aff=' + $q.ProcessorAffinity + ' prio=' + $q.PriorityClass)
+      } catch {
+        Write-PcbWLog ('parent pid ' + $q.Id + ' ' + $q.ProcessName + ' FAIL ' + $_.Exception.Message)
+      }
+    }
+    $alive = @{}
+    foreach ($sp in @(Get-Process -Name $sNames -ErrorAction SilentlyContinue)) {
+      if (-not $sp) { continue }
+      $alive[[string]$sp.Id] = 1
+      $curAff = $null
+      $curPrio = $null
+      try { $curAff = $sp.ProcessorAffinity; $curPrio = $sp.PriorityClass } catch { continue }
+      $affOK = ($curAff -eq $sideAff)
+      $prioOK = ($curPrio -eq 'Idle')
+      if ($affOK -and $prioOK) { continue }
+      try {
+        if (-not $affOK) { $sp.ProcessorAffinity = $sideAff }
+        if (-not $prioOK) { $sp.PriorityClass = 'Idle' }
+        Write-PcbWLog ('side pid ' + $sp.Id + ' ' + $sp.ProcessName + ' aff=' + $sp.ProcessorAffinity + ' prio=' + $sp.PriorityClass)
+      } catch {
+        Write-PcbWLog ('side pid ' + $sp.Id + ' ' + $sp.ProcessName + ' FAIL ' + $_.Exception.Message)
+      }
+    }
+    foreach ($p in @(Get-Process -Name $gName -ErrorAction SilentlyContinue)) {
+      if (-not $p) { continue }
+      $alive[[string]$p.Id] = 1
+      $curAff = $null
+      $curPrio = $null
+      try { $curAff = $p.ProcessorAffinity; $curPrio = $p.PriorityClass } catch { continue }
+      $affOK = ($curAff -eq $gameAff)
+      $prioOK = ($curPrio -eq 'High')
+      if ($affOK -and $prioOK) { continue }
+      try {
+        if (-not $affOK) { $p.ProcessorAffinity = $gameAff }
+        if (-not $prioOK) { $p.PriorityClass = 'High' }
+        $p.Refresh()
+        $key = [string]$p.ProcessorAffinity + '/' + [string]$p.PriorityClass
+        if ($seen[[string]$p.Id] -ne $key) {
+          Write-PcbWLog ('game pid ' + $p.Id + ' aff=' + $p.ProcessorAffinity + ' prio=' + $p.PriorityClass + ' (applied)')
+          $seen[[string]$p.Id] = $key
+        }
+      } catch {
+        Write-PcbWLog ('game pid ' + $p.Id + ' FAIL ' + $_.Exception.Message)
+      }
+    }
+    foreach ($k in @($seen.Keys)) { if (-not $alive[$k]) { $seen.Remove($k) } }
+    Start-Sleep -Seconds 2
+  }
+}
+
+function Invoke-PcbStepWatcher {
+  param($Masks)
+  if ($NoWatcher) {
+    Add-PcbRow 'h' 'watcher' 'n/a' 'n/a' 'SKIP: -NoWatcher' | Out-Null
+    Add-PcbRow 'h' 'timer' 'n/a' 'n/a' 'SKIP: needs the watcher' | Out-Null
+    return
+  }
+  if ($script:PcbDryRun) {
+    Add-PcbRow 'h' 'watcher' 'not running' ('game=' + (Format-PcbMask $Masks.GameMask) + ' side=' + (Format-PcbMask $Masks.SideMask)) 'DRYRUN' | Out-Null
+    Add-PcbRow 'h' 'timer' 'system default' '0.507 ms held' 'DRYRUN' | Out-Null
+    return
+  }
+  $timerBeforeMs = 'n/a'
+  if (Get-Command Get-PcbTimerResolution -ErrorAction SilentlyContinue) {
+    try {
+      $q0 = Get-PcbTimerResolution
+      if ($q0.Ok) { $timerBeforeMs = Format-PcbTimerMs ([int]$q0.Current) }
+    } catch { }
+  }
+  try {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+    $cfg = [pscustomobject]@{
+      GameName    = $GameName
+      GameMask    = $Masks.GameMask
+      SideMask    = $Masks.SideMask
+      SideNames   = @($SideNames)
+      ParentNames = @($ParentNames)
+    }
+    [System.IO.File]::WriteAllText((Join-Path $StateDir 'watcher.json'), ($cfg | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    # run the watcher from the local copy when there is one: step c2 restarts the USB
+    # controller and a stick the kit was launched from can drop out for a few seconds
+    $scriptPath = $PSCommandPath
+    if ($null -ne $script:PcbSelfPath -and (Test-Path -LiteralPath $script:PcbSelfPath)) { $scriptPath = $script:PcbSelfPath }
+    $argl = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -WatcherLoop -GameMask ' + $Masks.GameMask + ' -SideMask ' + $Masks.SideMask + ' -StateDir "' + $StateDir + '"'
+    $p = Start-Process -FilePath 'powershell.exe' -WindowStyle Hidden -ArgumentList $argl -PassThru -ErrorAction Stop
+    Set-Content -LiteralPath (Join-Path $StateDir 'watcher.pid') -Value ([string]$p.Id) -Encoding ASCII
+    $script:PcbState['Watcher'] = @{ Pid = $p.Id; Game = $Masks.GameMask; Side = $Masks.SideMask }
+    Save-PcbState
+    Start-Sleep -Milliseconds 600
+    $alive = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+    if ($alive) {
+      Add-PcbRow 'h' 'watcher' 'not running' ('pid ' + $p.Id) 'OK' | Out-Null
+    } else {
+      Add-PcbRow 'h' 'watcher' 'not running' ('pid ' + $p.Id) 'FAIL: watcher exited immediately' | Out-Null
+    }
+    # the timer row is only an OK when the system-wide resolution really moved
+    $timerAfterMs = 'n/a'
+    if (Get-Command Get-PcbTimerResolution -ErrorAction SilentlyContinue) {
+      $q1 = $null
+      for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Milliseconds 200
+        $q1 = Get-PcbTimerResolution
+        if ($q1.Ok -and [int]$q1.Current -le 5070 -and [int]$q1.Current -gt 0) { break }
+      }
+      if ($null -ne $q1 -and $q1.Ok) { $timerAfterMs = Format-PcbTimerMs ([int]$q1.Current) }
+      if ($timerAfterMs -ne 'n/a' -and $timerAfterMs -ne '0.000 ms') {
+        $st = 'OK'
+        if ($timerAfterMs -ne '0.507 ms') { $st = 'OK (written)' }
+        Add-PcbRow 'h' 'timer' $timerBeforeMs ($timerAfterMs + ' held') $st | Out-Null
+      } else {
+        Add-PcbRow 'h' 'timer' $timerBeforeMs 'unreadable' 'FAIL: NtQueryTimerResolution returned nothing' | Out-Null
+      }
+    } else {
+      Add-PcbRow 'h' 'timer' 'n/a' 'n/a' 'SKIP: timer module absent' | Out-Null
+    }
+  } catch {
+    Add-PcbRow 'h' 'watcher' 'not running' 'unknown' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+}
+
+function Restore-PcbWatcher {
+  if ($script:PcbDryRun) { return }
+  $w = $script:PcbState['Watcher']
+  if ($null -eq $w) { return }
+  $pidTxt = $null
+  try { $pidTxt = Get-Content -LiteralPath (Join-Path $StateDir 'watcher.pid') -Raw -ErrorAction Stop } catch { $pidTxt = $null }
+  $targets = New-Object System.Collections.ArrayList
+  $wPid = Get-PcbStateField $w 'Pid'
+  if ($null -ne $wPid) { [void]$targets.Add([int]$wPid) }
+  if ($pidTxt) {
+    $v = 0
+    if ([int]::TryParse($pidTxt.Trim(), [ref]$v)) { if (-not $targets.Contains($v)) { [void]$targets.Add($v) } }
+  }
+  foreach ($t in @($targets)) {
+    $proc = Get-Process -Id $t -ErrorAction SilentlyContinue
+    if ($null -eq $proc) {
+      Add-PcbRow 'r' 'watcher' ('pid ' + $t) 'gone' 'SKIP: already gone' | Out-Null
+      continue
+    }
+    try {
+      Stop-Process -Id $t -Force -ErrorAction Stop
+      Start-Sleep -Milliseconds 300
+      if (Get-Process -Id $t -ErrorAction SilentlyContinue) {
+        Add-PcbRow 'r' 'watcher' ('pid ' + $t) 'alive' 'FAIL: still running' | Out-Null
+      } else {
+        Add-PcbRow 'r' 'watcher' ('pid ' + $t) 'gone' 'OK' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'r' 'watcher' ('pid ' + $t) 'alive' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+  $pidFile = Join-Path $StateDir 'watcher.pid'
+  if (Test-Path -LiteralPath $pidFile) { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
+}
+
+# ===========================================================================
+# power setting table
+# ===========================================================================
+
+# -IdleDisable asks for IDLEDISABLE=1 (keep cores out of the idle state through play),
+# -NoIdleDisable forces 0, and with neither switch the kit measures (see the guard below)
+# because IDLEDISABLE=1 can lower single-core boost on a CPU whose turbo bin depends on
+# the number of active cores.  Home runs 1, so 1 is the default the guard starts from.
+$script:PcbIdleDisableWant = 1
+if ($NoIdleDisable) { $script:PcbIdleDisableWant = 0 }
+# -IdleDisable is an explicit order: keep 1 and do not spend time measuring.
+$script:PcbIdleDisableGuard = $true
+if ($IdleDisable -or $NoIdleDisable) { $script:PcbIdleDisableGuard = $false }
+
+$script:PcbPowerSettings = @(
+  @{ Item = 'PROCTHROTTLEMIN';  Sub = 'SUB_PROCESSOR'; Id = 'PROCTHROTTLEMIN';  Want = 100 },
+  @{ Item = 'PROCTHROTTLEMAX';  Sub = 'SUB_PROCESSOR'; Id = 'PROCTHROTTLEMAX';  Want = 100 },
+  @{ Item = 'CPMINCORES';       Sub = 'SUB_PROCESSOR'; Id = 'CPMINCORES';       Want = 100 },
+  @{ Item = 'PERFBOOSTMODE';    Sub = 'SUB_PROCESSOR'; Id = 'be337238-0d82-4146-a960-4f3749d470c7'; Want = 2 },
+  @{ Item = 'PERFEPP';          Sub = 'SUB_PROCESSOR'; Id = 'PERFEPP';          Want = 0 },
+  # the four hidden processor settings the home scripts write (p41.ps1:3-5, p50.ps1:11-12,
+  # p14.ps1:7).  Unhide=1 means a hidden attribute is cleared before the write and put
+  # back on revert only if the kit cleared it.
+  @{ Item = 'IDLEDEMOTE';       Sub = 'SUB_PROCESSOR'; Id = '4b92d758-5a24-4851-a470-815d78aee119'; Want = 0;   Unhide = 1 },
+  @{ Item = 'CPCONCURRENCY';    Sub = 'SUB_PROCESSOR'; Id = '93b8b6dc-0698-4d1c-9ee4-0644e900c85d'; Want = 100; Unhide = 1 },
+  @{ Item = 'SHORTSCHEDPOLICY'; Sub = 'SUB_PROCESSOR'; Id = '7b224883-b3cc-4d79-819f-8374152cbe7c'; Want = 1;   Unhide = 1 },
+  @{ Item = 'THROTTLING';       Sub = 'SUB_PROCESSOR'; Id = '3b04d4fd-1cc7-4f23-ab1c-d1337819c4bb'; Want = 2;   Unhide = 1 },
+  @{ Item = 'IDLEDISABLE';      Sub = 'SUB_PROCESSOR'; Id = 'IDLEDISABLE';      Want = $script:PcbIdleDisableWant },
+  @{ Item = 'USB-SelectiveSuspend'; Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Id = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; Want = 0 },
+  @{ Item = 'USB3-LinkPowerMgmt';   Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Id = 'd4e98f31-5ffe-4ce1-be31-1b38b384c009'; Want = 0 },
+  @{ Item = 'PCIE-ASPM';        Sub = 'SUB_PCIEXPRESS'; Id = 'ASPM';            Want = 0 },
+  @{ Item = 'DISK-IDLE';        Sub = 'SUB_DISK'; Id = 'DISKIDLE';              Want = 0 },
+  @{ Item = 'SLEEP-STANDBY';    Sub = 'SUB_SLEEP'; Id = 'STANDBYIDLE';          Want = 0 }
+)
+
+# ===========================================================================
+# reporting
+# ===========================================================================
+
+function Format-PcbCell($Value, [int]$Width) {
+  $s = ''
+  if ($null -ne $Value) { $s = [string]$Value }
+  $s = $s -replace "[`r`n`t]", ' '
+  # adapter descriptions can carry non-ASCII text; the console and the report stay 7-bit
+  $s = [regex]::Replace($s, '[^\x20-\x7E]', '?')
+  if ($s.Length -gt $Width) { $s = $s.Substring(0, $Width - 1) + '~' }
+  return $s.PadRight($Width)
+}
+
+function Get-PcbReportText {
+  $sb = New-Object System.Text.StringBuilder
+  [void]$sb.AppendLine((Format-PcbCell 'Step' 4) + ' ' + (Format-PcbCell 'Item' 34) + ' ' + (Format-PcbCell 'Before' 40) + ' ' + (Format-PcbCell 'After' 40) + ' Status')
+  [void]$sb.AppendLine(((('-' * 4) + ' ' + ('-' * 34) + ' ' + ('-' * 40) + ' ' + ('-' * 40) + ' ' + ('-' * 40))))
+  foreach ($r in $script:PcbRows) {
+    [void]$sb.AppendLine((Format-PcbCell $r.Step 4) + ' ' + (Format-PcbCell $r.Item 34) + ' ' + (Format-PcbCell $r.Before 40) + ' ' + (Format-PcbCell $r.After 40) + ' ' + [string]$r.Status)
+  }
+  return $sb.ToString()
+}
+
+function Write-PcbReport {
+  $text = Get-PcbReportText
+  Write-PcbLine ''
+  Write-PcbLine $text
+  try {
+    # -DryRun writes nothing: it may use a StateDir that is already there (a test hands it
+    # one) but it never creates one.  Otherwise a plain `check.ps1` dry run would leave an
+    # empty ProgramData\pcbang-tune behind on a PC that was only being inspected.
+    if (-not (Test-Path -LiteralPath $StateDir)) {
+      if ($script:PcbDryRun) { return }
+      New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+    }
+    $hdr = 'pcbang-tune ' + (Get-Date -Format s) + '  mode=' + $script:PcbMode
+    $body = @($hdr, '') + @($text -split "`r`n")
+    [System.IO.File]::WriteAllText((Join-Path $StateDir 'report.txt'), (($body -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
+}
+
+# ===========================================================================
+# game boot mode (W-RB3)
+#
+# Two boot entries: the office one (the real {current}) is never touched, and a hidden
+# copy carries the boot tweaks.  Three things keep them apart:
+#   - install  (-GameBoot)   : make the hidden entry, the two tasks, the icon, game.json
+#   - the icon (-GameReboot) : flip the boot-read registry to the game values NOW (they
+#                              are read at shutdown), arm a one-time bootsequence, restart
+#   - the tasks              : -GameStartup runs as SYSTEM at boot, -GameLogon at logon
+# Everything the kit needs to undo the switch lives in game.json, so a crash between steps
+# still leaves a revertible state.
+# ===========================================================================
+
+$script:PcbGameEntryDesc = 'Windows (pcbang game)'
+# frozen at the entry point from the script-level $PSBoundParameters (see the entry block)
+$script:PcbBoundParams = @{}
+# 0xAC8C 0xC784 / 0xBAA8 0xB4DC 0xB85C / 0xC7AC 0xBD80 0xD305 = "game mode reboot" in Hangul
+$script:PcbGameIconCodes = @(0xAC8C, 0xC784, 0x20, 0xBAA8, 0xB4DC, 0xB85C, 0x20, 0xC7AC, 0xBD80, 0xD305)
+$script:PcbGameIconName = (-join (@($script:PcbGameIconCodes) | ForEach-Object { [char]$_ })) + '.lnk'
+
+function Get-PcbGamePath { return (Join-Path $StateDir 'game.json') }
+
+function Get-PcbGameIconCodesText {
+  $parts = @()
+  foreach ($c in @($script:PcbGameIconCodes)) { $parts += ('U+' + ([int]$c).ToString('X4')) }
+  return ($parts -join ' ')
+}
+
+# game.json is read on a later run (ConvertFrom-Json) and on the same run (hashtable), so
+# every read goes through Get-PcbStateField, which answers for both shapes.
+function Read-PcbGame {
+  $p = Get-PcbGamePath
+  if (-not (Test-Path -LiteralPath $p)) { return $null }
+  $obj = $null
+  # Save-PcbGame writes UTF-8 without a BOM, and the shortcut path carries Korean
+  # characters: Get-Content -Raw would decode it as ANSI on 5.1 and the path would no
+  # longer match the file on disk, so the revert could not find the icon to delete.
+  try { $obj = [System.IO.File]::ReadAllText($p, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json } catch { return $null }
+  if ($null -eq $obj) { return $null }
+  $h = @{}
+  foreach ($pr in $obj.PSObject.Properties) { $h[$pr.Name] = $pr.Value }
+  return $h
+}
+
+function Save-PcbGame($Game) {
+  if ($script:PcbDryRun) { return $false }
+  try {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+    $json = $Game | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText((Get-PcbGamePath), $json, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+  } catch {
+    Write-PcbLine ('game.json save failed: ' + $_.Exception.Message)
+    return $false
+  }
+}
+
+function Remove-PcbGameFile {
+  try {
+    $p = Get-PcbGamePath
+    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Initialize-PcbBootSeams {
+  if (-not [string]::IsNullOrWhiteSpace($BcdStore)) { $script:PcbBootBcdStore = $BcdStore }
+  if (-not [string]::IsNullOrWhiteSpace($BootRegRoot)) { $script:PcbBootRegRoot = $BootRegRoot }
+  if (-not [string]::IsNullOrWhiteSpace($BootIfGuid)) { $script:PcbBootIfGuid = $BootIfGuid }
+}
+
+function Get-PcbBootedId {
+  if (-not [string]::IsNullOrWhiteSpace($BootedId)) { return [string]$BootedId }
+  $id = $null
+  try { $id = Get-PcbBootCurrentId } catch { $id = $null }
+  return $id
+}
+
+# The parameters an install carries into the two tasks and the logon child: everything the
+# caller bound except the mode switches and the seams that must be recomputed per run
+# (BootedId).
+function Get-PcbCarriedArgs {
+  # NoPause is skipped because every child command line appends its own -NoPause: a switch
+  # bound twice on one command line is a binding error, and the child would never start.
+  $skip = @('GameBoot', 'GameReboot', 'GameStartup', 'GameLogon', 'GameChild', 'Revert', 'DryRun', 'NoRebootPrompt', 'NoPause', 'WatcherLoop', 'DotSource', 'BootedId', 'Gui', 'GuiTestSec', 'GuiShot', 'GuiTestAction', 'GuiLogOut')
+  $out = New-Object System.Collections.ArrayList
+  foreach ($k in @($script:PcbBoundParams.Keys)) {
+    if ($skip -contains $k) { continue }
+    $v = $script:PcbBoundParams[$k]
+    if ($v -is [switch] -or $v -is [bool]) { if ($v) { [void]$out.Add('-' + $k) }; continue }
+    if ($v -is [array]) {
+      [void]$out.Add('-' + $k)
+      [void]$out.Add((($v | ForEach-Object { '"' + ([string]$_ -replace '"', '') + '"' }) -join ','))
+      continue
+    }
+    if ($null -eq $v) { continue }
+    $s = [string]$v
+    if ($s -eq '') { continue }
+    [void]$out.Add('-' + $k)
+    [void]$out.Add('"' + ($s -replace '"', '') + '"')
+  }
+  return @($out)
+}
+
+function Register-PcbGameTask {
+  param([string]$Name, [string]$ArgsText, $Trigger, $Principal)
+  $res = [pscustomobject]@{ Ok = $false; Error = '' }
+  try {
+    $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $ArgsText
+    Register-ScheduledTask -TaskName $Name -Action $act -Trigger $Trigger -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    $res.Ok = $true
+  } catch {
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Unregister-PcbGameTask([string]$Name) {
+  $res = [pscustomobject]@{ Ok = $true; Existed = $false; Error = '' }
+  try {
+    $tk = $null
+    try { $tk = Get-ScheduledTask -TaskName $Name -ErrorAction Stop } catch { $tk = $null }
+    if ($null -eq $tk) { return $res }
+    $res.Existed = $true
+    Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction Stop | Out-Null
+  } catch {
+    $res.Ok = $false
+    $res.Error = [string]$_.Exception.Message
+  }
+  return $res
+}
+
+function Invoke-PcbReboot {
+  # The ONLY place the kit restarts the machine.  -RebootCmdFile (tests) records the line
+  # instead, so no run in this repo ever reboots the PC.
+  $line = (Get-Date -Format s) + ' shutdown.exe /r /t 5 /c "pcbang-tune"'
+  if (-not [string]::IsNullOrWhiteSpace($RebootCmdFile)) {
+    try {
+      [System.IO.File]::AppendAllText($RebootCmdFile, ($line + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+      Write-PcbLine ('reboot deferred, recorded in ' + $RebootCmdFile)
+      return 0
+    } catch {
+      Write-PcbLine ('reboot record failed: ' + $_.Exception.Message)
+      return 1
+    }
+  }
+  try {
+    $exe = Join-Path $env:SystemRoot 'System32\shutdown.exe'
+    & $exe /r /t 5 /c 'pcbang-tune'
+    return 0
+  } catch {
+    Write-PcbLine ('reboot failed: ' + $_.Exception.Message)
+    return 1
+  }
+}
+
+function Add-PcbGameRows($Rows) {
+  foreach ($r in @($Rows)) {
+    if ($null -eq $r) { continue }
+    Add-PcbRow 'r' ([string]$r.Item) $r.Before $r.After ([string]$r.Status) | Out-Null
+  }
+}
+
+function Add-PcbGameDryRows {
+  # read-only: one row per boot plan row (the current entry as the Before reference), then
+  # the entry, the two tasks and the icon.
+  $plan = @()
+  try { $plan = @(Get-PcbBootPlan) } catch { $plan = @() }
+  foreach ($p in $plan) {
+    $item = [string]$p.Item
+    if ([string]$p.Kind -eq 'bcd') { $item = 'bcd: ' + $item }
+    Add-PcbRow 'r' $item $p.Before $p.Want 'DRYRUN' | Out-Null
+  }
+  Add-PcbRow 'r' 'game boot entry' 'absent' $script:PcbGameEntryDesc 'DRYRUN' | Out-Null
+  Add-PcbRow 'r' ('task/' + $TaskPrefix + '-startup') 'absent' 'SYSTEM at boot' 'DRYRUN' | Out-Null
+  Add-PcbRow 'r' ('task/' + $TaskPrefix + '-logon') 'absent' 'user at logon +20 s' 'DRYRUN' | Out-Null
+  Add-PcbRow 'r' 'game icon' 'absent' $script:PcbGameIconName 'DRYRUN' | Out-Null
+}
+
+function Invoke-PcbGameInstall {
+  $gameFile = Get-PcbGamePath
+  $stateFile = Join-Path $StateDir 'state.json'
+
+  if (Test-Path -LiteralPath $gameFile) {
+    Write-PcbLine 'game boot mode is already installed'
+    Write-PcbLine ('game file: ' + $gameFile)
+    return 1
+  }
+  if (Test-Path -LiteralPath $stateFile) {
+    Write-PcbLine 'already applied, run REVERT first'
+    Write-PcbLine ('state file: ' + $stateFile)
+    return 1
+  }
+
+  if (-not (Test-Path -LiteralPath $StateDir)) {
+    try { New-Item -ItemType Directory -Path $StateDir -Force -ErrorAction Stop | Out-Null } catch { Write-PcbLine ('cannot create StateDir: ' + $_.Exception.Message); return 1 }
+  }
+
+  $selfCopy = Join-Path $StateDir 'pcbang.ps1'
+  try {
+    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+      Copy-Item -LiteralPath $PSCommandPath -Destination $selfCopy -Force -ErrorAction Stop
+    }
+  } catch { }
+  if (-not (Test-Path -LiteralPath $selfCopy)) {
+    Write-PcbLine ('could not place the self copy: ' + $selfCopy)
+    return 1
+  }
+  Add-PcbRow 'r' 'self copy' 'absent' $selfCopy 'OK' | Out-Null
+
+  # The whole-store backup is the undo of last resort for the BCD half, so it happens
+  # before the first write and a failure aborts the install.  Under a store seam the
+  # store IS a file, and /export is rejected when a /store prefix is present, so the
+  # copy is taken directly instead of re-exporting whatever the live store holds.
+  $bak = Join-Path $StateDir 'bcd-backup.bcd'
+  if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+  $seam = [string]$script:PcbBootBcdStore
+  if (-not [string]::IsNullOrWhiteSpace($seam)) {
+    $exp = [pscustomobject]@{ Code = -1; Out = '' }
+    try { Copy-Item -LiteralPath $seam -Destination $bak -Force -ErrorAction Stop; $exp.Code = 0 } catch { $exp.Out = $_.Exception.Message }
+  } else {
+    $exp = Invoke-PcbBcd -Args @('/export', $bak)
+  }
+  if ([int]$exp.Code -ne 0 -or -not (Test-Path -LiteralPath $bak)) {
+    Add-PcbRow 'r' 'bcd backup' 'absent' 'absent' ('FAIL: ' + ([string]$exp.Out).Trim()) | Out-Null
+    Write-PcbReport
+    Write-PcbLine 'bcd backup failed: nothing was changed'
+    return 1
+  }
+  Add-PcbRow 'r' 'bcd backup' 'absent' $bak 'OK' | Out-Null
+
+  $entry = New-PcbBootEntry -Description $script:PcbGameEntryDesc
+  if (-not $entry.Ok -or [string]::IsNullOrWhiteSpace([string]$entry.Id)) {
+    Add-PcbRow 'r' 'game boot entry' 'absent' 'absent' ('FAIL: ' + [string]$entry.Error) | Out-Null
+    Write-PcbReport
+    Write-PcbLine 'boot entry creation failed: nothing else was changed'
+    return 1
+  }
+  $gameId = [string]$entry.Id
+  Add-PcbRow 'r' 'game boot entry' 'absent' $gameId 'OK' | Out-Null
+
+  # game.json exists from here on: it is the only record REVERT can find, so a failure at
+  # any later step must never leave the entry (or the tasks/icon) behind with no file.
+  $carriedList = @(Get-PcbCarriedArgs)
+  $carried = ($carriedList -join ' ')
+  $game = @{
+    GameId    = $gameId
+    Tasks     = @()
+    Shortcut  = ''
+    BcdBackup = $bak
+    Carried   = $carried
+  }
+  if (-not (Save-PcbGame $game)) {
+    [void](Remove-PcbBootEntry -Id $gameId)
+    Add-PcbRow 'r' 'game boot entry' $gameId 'absent' 'OK (rolled back)' | Out-Null
+    Write-PcbReport
+    Write-PcbLine 'game.json could not be written: the entry was removed again'
+    return 1
+  }
+
+  $set = Set-PcbBoot -BcdId $gameId -SkipReg
+  Add-PcbGameRows $set.Rows
+  if (-not $set.Ok) {
+    $rb = Remove-PcbBootEntry -Id $gameId
+    [void](Remove-PcbGameFile)
+    Add-PcbRow 'r' 'game boot entry' $gameId 'absent' 'OK (rolled back)' | Out-Null
+    Write-PcbReport
+    Write-PcbLine ('boot tweak write failed: ' + [string]$set.Error)
+    return 1
+  }
+
+  $startupName = $TaskPrefix + '-startup'
+  $logonName = $TaskPrefix + '-logon'
+  $actBase = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $selfCopy + '"'
+  $startupArgs = $actBase + ' -GameStartup -NoPause'
+  $logonArgs = $actBase + ' -GameLogon -NoPause'
+  if ($carried -ne '') {
+    $startupArgs = $startupArgs + ' ' + $carried
+    $logonArgs = $logonArgs + ' ' + $carried
+  }
+
+  $userName = ''
+  try { $userName = [string]([Security.Principal.WindowsIdentity]::GetCurrent()).Name } catch { $userName = '' }
+
+  $taskOk = $true
+  $r1 = $null
+  $r2 = $null
+  try {
+    $trS = New-ScheduledTaskTrigger -AtStartup
+    $prS = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $r1 = Register-PcbGameTask -Name $startupName -ArgsText $startupArgs -Trigger $trS -Principal $prS
+  } catch {
+    $r1 = [pscustomobject]@{ Ok = $false; Error = [string]$_.Exception.Message }
+  }
+  if ($null -eq $r1 -or -not $r1.Ok) {
+    $taskOk = $false
+    Add-PcbRow 'r' ('task/' + $startupName) 'absent' 'absent' ('FAIL: ' + [string]$r1.Error) | Out-Null
+  } else {
+    Add-PcbRow 'r' ('task/' + $startupName) 'absent' 'SYSTEM at boot' 'OK' | Out-Null
+  }
+  if ($taskOk) {
+    try {
+      $trL = New-ScheduledTaskTrigger -AtLogOn -User $userName
+      try { $trL.Delay = 'PT20S' } catch { }
+      $prL = New-ScheduledTaskPrincipal -UserId $userName -LogonType Interactive -RunLevel Highest
+      $r2 = Register-PcbGameTask -Name $logonName -ArgsText $logonArgs -Trigger $trL -Principal $prL
+    } catch {
+      $r2 = [pscustomobject]@{ Ok = $false; Error = [string]$_.Exception.Message }
+    }
+    if ($null -eq $r2 -or -not $r2.Ok) {
+      $taskOk = $false
+      Add-PcbRow 'r' ('task/' + $logonName) 'absent' 'absent' ('FAIL: ' + [string]$r2.Error) | Out-Null
+    } else {
+      Add-PcbRow 'r' ('task/' + $logonName) 'absent' ('user ' + $userName + ' at logon +20 s') 'OK' | Out-Null
+    }
+  }
+
+  if (-not $taskOk) {
+    [void](Unregister-PcbGameTask $startupName)
+    [void](Unregister-PcbGameTask $logonName)
+    [void](Remove-PcbBootEntry -Id $gameId)
+    [void](Remove-PcbGameFile)
+    Add-PcbRow 'r' 'game boot entry' $gameId 'absent' 'OK (rolled back)' | Out-Null
+    Write-PcbReport
+    Write-PcbLine 'scheduled task registration failed: the entry and the tasks were removed again'
+    return 1
+  }
+
+  $iconDir = $ShortcutDir
+  if ([string]::IsNullOrWhiteSpace($iconDir)) {
+    try { $iconDir = [Environment]::GetFolderPath('Desktop') } catch { $iconDir = '' }
+  }
+  $lnk = ''
+  $iconOk = $false
+  if (-not [string]::IsNullOrWhiteSpace($iconDir)) {
+    $lnk = Join-Path $iconDir $script:PcbGameIconName
+    $iconOk = (New-PcbGameShortcut -Path $lnk -StateDir $StateDir)
+  }
+  if ($iconOk) {
+    Add-PcbRow 'r' 'game icon' 'absent' $lnk 'OK' | Out-Null
+  } else {
+    Add-PcbRow 'r' 'game icon' 'absent' 'absent' 'FAIL: shortcut could not be created' | Out-Null
+  }
+  Write-PcbLine ('shortcut file name char codes: ' + (Get-PcbGameIconCodesText))
+
+  $game['Tasks'] = @($startupName, $logonName)
+  $game['Shortcut'] = $lnk
+  if (-not (Save-PcbGame $game)) {
+    # the entry, the tasks and the icon are all in memory here, so the revert can run even
+    # though nothing could be recorded: no orphan may survive a failed install.
+    [void](Invoke-PcbGameTeardown $game)
+    Write-PcbReport
+    Write-PcbLine 'game.json could not be written: the entry, the tasks and the icon were removed again'
+    return 1
+  }
+
+  Write-PcbReport
+  Write-PcbLine 'game boot mode installed'
+  Write-PcbLine ('game boot entry: ' + $gameId + '  (hidden: not in displayorder)')
+  Write-PcbLine ('tasks: ' + $startupName + ' (SYSTEM at boot), ' + $logonName + ' (at logon)')
+  Write-PcbLine 'every normal boot stays the office boot'
+
+  if ($NoRebootPrompt) {
+    Write-PcbLine 'restart later with the desktop icon'
+    return 0
+  }
+  $answer = ''
+  $interactive = $false
+  try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+  if (-not $interactive) {
+    Write-PcbLine 'restart later with the desktop icon'
+    return 0
+  }
+  Write-PcbLine 'Restart into GAME mode now? [Y/n]'
+  try { $answer = [string][Console]::In.ReadLine() } catch { $answer = '' }
+  $answer = $answer.Trim().ToLowerInvariant()
+  if ($answer -eq '' -or $answer -eq 'y' -or $answer -eq 'yes') {
+    return (Invoke-PcbGameRebootRun)
+  }
+  Write-PcbLine 'restart later with the desktop icon'
+  return 0
+}
+
+function New-PcbGameShortcut {
+  param([string]$Path, [string]$StateDir)
+  try {
+    $dir = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $self = Join-Path $StateDir 'pcbang.ps1'
+    $ws = New-Object -ComObject WScript.Shell
+    $lnk = $ws.CreateShortcut($Path)
+    $lnk.TargetPath = $psExe
+    $lnk.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $self + '" -GameReboot'
+    $lnk.WorkingDirectory = $StateDir
+    $lnk.IconLocation = $psExe + ',0'
+    $lnk.Description = 'pcbang game boot'
+    $lnk.Save()
+    if (Test-Path -LiteralPath $Path) { return $true }
+    return $false
+  } catch {
+    return $false
+  }
+}
+
+function Invoke-PcbGameRebootRun {
+  $game = Read-PcbGame
+  if ($null -eq $game) {
+    Write-PcbLine 'game boot mode is not installed (no game.json)'
+    Write-PcbLine 'run run-gameboot.ps1 first'
+    return 1
+  }
+  $gameId = [string](Get-PcbStateField $game 'GameId')
+  if ([string]::IsNullOrWhiteSpace($gameId)) {
+    Write-PcbLine 'game.json has no GameId: run REVERT, then run-gameboot.ps1'
+    return 1
+  }
+
+  # BitLocker first: the boot entry's BCD values are measured, and a re-measure on a
+  # protected volume can stop the boot for a recovery key.  Protection is suspended for
+  # exactly the one reboot (the startup task suspends it again for the office boot).
+  $bl = Get-PcbBootBitLocker
+  if ($bl.ProtectionOn) {
+    $sus = Suspend-PcbBootBitLocker
+    if (-not $sus.Ok) {
+      Add-PcbRow 'r' 'bitlocker' 'protected' 'protected' ('FAIL: ' + [string]$sus.Error) | Out-Null
+      Write-PcbReport
+      Write-PcbLine ('bitlocker suspend failed: ' + [string]$sus.Error)
+      Write-PcbLine 'nothing was changed'
+      return 1
+    }
+    Add-PcbRow 'r' 'bitlocker' 'protected' 'suspended' 'OK' | Out-Null
+  }
+
+  $flipped = $false
+  $pending = Get-PcbStateField $game 'PendingReg'
+  if ($null -eq $pending) {
+    $set = Set-PcbBoot -SkipBcd
+    Add-PcbGameRows $set.Rows
+    if (-not $set.Ok) {
+      Write-PcbReport
+      Write-PcbLine ('registry flip failed: ' + [string]$set.Error)
+      return 1
+    }
+    $pending = $set.Rec
+    $flipped = $true
+  }
+
+  # game.json is written BEFORE the bootsequence: the sequence is what enters the game boot,
+  # so a failure to record the flip must prevent it, not follow it.
+  if ($flipped) {
+    $game['PendingReg'] = $pending
+    if (-not (Save-PcbGame $game)) {
+      $back = Restore-PcbBoot -Rec $pending
+      Add-PcbGameRows $back.Rows
+      Write-PcbReport
+      Write-PcbLine 'game.json could not be written: the registry values were put back, nothing else was changed'
+      return 1
+    }
+  }
+
+  $seq = Set-PcbBootSequence -Id $gameId
+  if (-not $seq.Ok) {
+    if ($flipped -and $null -ne $pending) {
+      $back = Restore-PcbBoot -Rec $pending
+      Add-PcbGameRows $back.Rows
+      # undo exactly what this run recorded: a PendingReg that was already there stays
+      $game['PendingReg'] = $null
+      [void](Save-PcbGame $game)
+    }
+    Add-PcbRow 'r' 'boot sequence' 'absent' 'absent' ('FAIL: ' + [string]$seq.Error) | Out-Null
+    Write-PcbReport
+    Write-PcbLine ('one-time boot sequence failed: ' + [string]$seq.Error)
+    Write-PcbLine 'the registry values were put back; nothing else was changed'
+    return 1
+  }
+  Add-PcbRow 'r' 'boot sequence' 'absent' $gameId 'OK' | Out-Null
+
+  Write-PcbReport
+  Write-PcbLine 'game boot armed for the NEXT restart only'
+  $rc = Invoke-PcbReboot
+  return $rc
+}
+
+function Get-PcbStartupReportPath { return (Join-Path $StateDir 'startup-report.txt') }
+
+function Write-PcbGameReport {
+  param([string]$Path, [string]$Header, [string[]]$Lines)
+  if ($script:PcbDryRun) { return }
+  try {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+    $body = @($Header, '') + @($Lines) + @('', '')
+    [System.IO.File]::AppendAllText($Path, (($body -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+  } catch { }
+}
+
+function Invoke-PcbGameStartup {
+  $game = Read-PcbGame
+  if ($null -eq $game) { return 0 }
+  $gameId = [string](Get-PcbStateField $game 'GameId')
+  $booted = Get-PcbBootedId
+  $isGame = ($booted -ne '' -and $booted -ieq $gameId)
+  $lines = New-Object System.Collections.ArrayList
+  $mode = 'office'
+  if ($isGame) { $mode = 'game' }
+  [void]$lines.Add('pcbang-tune startup task ' + (Get-Date -Format s))
+  [void]$lines.Add('booted id: ' + $booted + '  (' + $mode + ' boot)')
+  [void]$lines.Add('game id:   ' + $gameId)
+
+  if ($isGame) {
+    # The boot-read values must still read game at every late consumer: MMCSS is an
+    # ungrouped auto-start driver that SCM starts after the grouped ones, and per-interface
+    # Tcpip values are read at interface bind, both possibly after this task.  The restore
+    # therefore runs in the logon task, after its child apply has finished.
+    [void]$lines.Add('registry restore deferred to the logon task (late readers: MMCSS, per-interface TCP)')
+    $bl = Get-PcbBootBitLocker
+    if ($bl.ProtectionOn) {
+      $sus = Suspend-PcbBootBitLocker
+      if ($sus.Ok) { [void]$lines.Add('bitlocker suspended for the next office boot') }
+      else { [void]$lines.Add('FAIL: bitlocker suspend: ' + [string]$sus.Error) }
+    } else {
+      [void]$lines.Add('bitlocker: not protected on this volume')
+    }
+  } else {
+    $pending = Get-PcbStateField $game 'PendingReg'
+    if ($null -ne $pending) {
+      # crash fallback: the icon flipped the registry but the game boot never ran
+      $res = Restore-PcbBoot -Rec $pending
+      foreach ($r in @($res.Rows)) { [void]$lines.Add(('reg  ' + [string]$r.Item + ' | ' + [string](Get-PcbStateField $r 'Status'))) }
+      if ($res.Ok) {
+        $game['PendingReg'] = $null
+        [void](Save-PcbGame $game)
+        [void]$lines.Add('pending registry record restored')
+      } else {
+        [void]$lines.Add('FAIL: registry restore: ' + [string]$res.Error)
+      }
+    }
+    $kept = Get-PcbStateField $game 'HiberKept'
+    if ($null -ne $kept) {
+      $res2 = Restore-PcbBoot -Rec $kept
+      foreach ($r in @($res2.Rows)) { [void]$lines.Add(('reg  ' + [string]$r.Item + ' | ' + [string](Get-PcbStateField $r 'Status'))) }
+      if ($res2.Ok) {
+        $game['HiberKept'] = $null
+        [void](Save-PcbGame $game)
+        [void]$lines.Add('HiberbootEnabled restored')
+      } else {
+        [void]$lines.Add('FAIL: hiberboot restore: ' + [string]$res2.Error)
+      }
+    }
+  }
+
+  foreach ($l in @($lines)) { Write-PcbLine $l }
+  Write-PcbGameReport -Path (Get-PcbStartupReportPath) -Header ('startup ' + $mode) -Lines @($lines)
+  return 0
+}
+
+function Invoke-PcbChildRun {
+  param([string]$ArgsText, [string]$LogPath, [string]$Tag)
+  $rec = [pscustomobject]@{ Code = -1; Out = '' }
+  $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $so = ''
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = $ArgsText
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $StateDir
+    $p = [System.Diagnostics.Process]::Start($psi)
+    # read asynchronously: the apply report is far bigger than the pipe buffer, and
+    # ReadToEnd() before WaitForExit would deadlock once the buffer fills.
+    $tOut = $p.StandardOutput.ReadToEndAsync()
+    $tErr = $p.StandardError.ReadToEndAsync()
+    $deadline = (Get-Date).AddMinutes(30)
+    while (-not $p.HasExited) {
+      Start-Sleep -Milliseconds 500
+      if ((Get-Date) -gt $deadline) { try { $p.Kill() } catch { }; break }
+    }
+    $so = ''
+    try { $so = [string]$tOut.Result } catch { $so = '' }
+    $se = ''
+    try { $se = [string]$tErr.Result } catch { $se = '' }
+    if (-not [string]::IsNullOrEmpty($se)) { $so = $so + $se }
+    $rec.Code = [int]$p.ExitCode
+    try { $p.Dispose() } catch { }
+  } catch {
+    $so = [string]$_.Exception.Message
+    $rec.Code = -1
+  }
+  $rec.Out = $so
+  Write-PcbGameReport -Path $LogPath -Header ($Tag + ' exit=' + [string]$rec.Code) -Lines @([regex]::Split($so, '\r\n|\n|\r'))
+  return $rec
+}
+
+function Invoke-PcbGameLogon {
+  $game = Read-PcbGame
+  if ($null -eq $game) { return 0 }
+  $gameId = [string](Get-PcbStateField $game 'GameId')
+  $booted = Get-PcbBootedId
+  $isGame = ($booted -ne '' -and $booted -ieq $gameId)
+  $logPath = Join-Path $StateDir 'logon-report.txt'
+  $self = Join-Path $StateDir 'pcbang.ps1'
+  $stateFile = Join-Path $StateDir 'state.json'
+  $mode = 'office'
+  if ($isGame) { $mode = 'game' }
+  Write-PcbLine ('pcbang-tune logon task ' + (Get-Date -Format s))
+  Write-PcbLine ('booted id: ' + $booted + '  (' + $mode + ' boot)')
+  Write-PcbGameReport -Path $logPath -Header ('logon ' + $mode + ' ' + (Get-Date -Format s)) -Lines @('booted id: ' + $booted + ' (' + $mode + ')')
+
+  if (-not (Test-Path -LiteralPath $self)) {
+    Write-PcbLine ('self copy missing: ' + $self)
+    Write-PcbGameReport -Path $logPath -Header 'logon' -Lines @('self copy missing: ' + $self)
+    return 0
+  }
+
+  $carried = [string](Get-PcbStateField $game 'Carried')
+  $base = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $self + '"'
+  $haveState = Test-Path -LiteralPath $stateFile
+
+  if ($isGame) {
+    if ($haveState) {
+      $a = $base + ' -Revert -GameChild -NoPause'
+      if ($carried -ne '') { $a = $a + ' ' + $carried }
+      $r = Invoke-PcbChildRun -ArgsText $a -LogPath $logPath -Tag 'child revert'
+      Write-PcbLine ('child revert exit=' + [string]$r.Code)
+    }
+    $a2 = $base + ' -GameChild -NoPause'
+    if ($carried -ne '') { $a2 = $a2 + ' ' + $carried }
+    $r2 = Invoke-PcbChildRun -ArgsText $a2 -LogPath $logPath -Tag 'child apply'
+    Write-PcbLine ('child apply exit=' + [string]$r2.Code)
+
+    # the restore the startup task now defers: run it only after the live set is in place,
+    # so every boot-read value was still game while MMCSS / the interfaces came up
+    $game = Read-PcbGame
+    $pending = Get-PcbStateField $game 'PendingReg'
+    if ($null -ne $pending) {
+      $res = Restore-PcbBoot -Rec $pending -Exclude @('HiberbootEnabled')
+      $rl = @(); foreach ($r in @($res.Rows)) { $rl += ('reg  ' + [string]$r.Item + ' | ' + [string](Get-PcbStateField $r 'Status')) }
+      if ($res.Ok) {
+        # keep the OLDEST record: after an icon press inside a game boot the new PendingReg holds 0 for HiberbootEnabled
+        if ($null -eq (Get-PcbStateField $game 'HiberKept')) { $game['HiberKept'] = $res.Kept }
+        $game['PendingReg'] = $null
+        if (Save-PcbGame $game) {
+          $rl += 'registry restored except HiberbootEnabled (kept for the office boot)'
+        } else {
+          # the values are already back: the record surviving only means the office boot
+          # re-applies an idempotent restore, so this is reported rather than rolled back
+          $rl += 'registry restored except HiberbootEnabled, but game.json could not be updated'
+        }
+      } else {
+        $rl += ('FAIL: registry restore: ' + [string]$res.Error)
+      }
+    } else {
+      $rl = @('no pending registry record')
+    }
+    foreach ($l in $rl) { Write-PcbLine $l }
+    Write-PcbGameReport -Path $logPath -Header 'logon registry restore' -Lines $rl
+  } else {
+    if ($haveState) {
+      $a = $base + ' -Revert -GameChild -NoPause'
+      if ($carried -ne '') { $a = $a + ' ' + $carried }
+      $r = Invoke-PcbChildRun -ArgsText $a -LogPath $logPath -Tag 'child revert'
+      Write-PcbLine ('child revert exit=' + [string]$r.Code)
+    } else {
+      Write-PcbLine 'office boot, no live set to revert'
+    }
+  }
+  return 0
+}
+
+function Invoke-PcbGameTeardown($Game) {
+  $gameId = [string](Get-PcbStateField $Game 'GameId')
+
+  $pending = Get-PcbStateField $Game 'PendingReg'
+  if ($null -ne $pending) {
+    $res = Restore-PcbBoot -Rec $pending
+    Add-PcbGameRows $res.Rows
+    if ($res.Ok) { $Game['PendingReg'] = $null; [void](Save-PcbGame $Game) }
+  }
+  $kept = Get-PcbStateField $Game 'HiberKept'
+  if ($null -ne $kept) {
+    $res2 = Restore-PcbBoot -Rec $kept
+    Add-PcbGameRows $res2.Rows
+    if ($res2.Ok) { $Game['HiberKept'] = $null; [void](Save-PcbGame $Game) }
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($gameId)) {
+    $cur = $null
+    try { $cur = Get-PcbBootSequenceId } catch { $cur = $null }
+    if ($null -ne $cur -and ([string]$cur -ieq $gameId)) {
+      $c = Clear-PcbBootSequence
+      if ($c.Ok) { Add-PcbRow 'r' 'boot sequence' $gameId 'absent' 'OK' | Out-Null }
+      else { Add-PcbRow 'r' 'boot sequence' $gameId $gameId ('FAIL: ' + [string]$c.Error) | Out-Null }
+    }
+    $rem = Remove-PcbBootEntry -Id $gameId
+    if ($rem.Ok) { Add-PcbRow 'r' 'game boot entry' $gameId 'absent' 'OK' | Out-Null }
+    else { Add-PcbRow 'r' 'game boot entry' $gameId $gameId ('FAIL: ' + [string]$rem.Error) | Out-Null }
+  }
+
+  foreach ($tn in @(Get-PcbStateField $Game 'Tasks')) {
+    $name = [string]$tn
+    if ([string]::IsNullOrWhiteSpace($name)) { continue }
+    $u = Unregister-PcbGameTask $name
+    if (-not $u.Existed) { Add-PcbRow 'r' ('task/' + $name) 'absent' 'absent' 'SKIP: not present' | Out-Null }
+    elseif ($u.Ok) { Add-PcbRow 'r' ('task/' + $name) 'present' 'absent' 'OK' | Out-Null }
+    else { Add-PcbRow 'r' ('task/' + $name) 'present' 'present' ('FAIL: ' + [string]$u.Error) | Out-Null }
+  }
+
+  $lnk = [string](Get-PcbStateField $Game 'Shortcut')
+  if (-not [string]::IsNullOrWhiteSpace($lnk)) {
+    try {
+      if (Test-Path -LiteralPath $lnk) {
+        Remove-Item -LiteralPath $lnk -Force -ErrorAction Stop
+        Add-PcbRow 'r' 'game icon' 'present' 'absent' 'OK' | Out-Null
+      } else {
+        Add-PcbRow 'r' 'game icon' 'absent' 'absent' 'SKIP: not present' | Out-Null
+      }
+    } catch {
+      Add-PcbRow 'r' 'game icon' 'present' 'present' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+
+  $bak = [string](Get-PcbStateField $Game 'BcdBackup')
+  if (-not [string]::IsNullOrWhiteSpace($bak)) {
+    try {
+      if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction Stop }
+      Add-PcbRow 'r' 'bcd backup' 'present' 'absent' 'OK' | Out-Null
+    } catch {
+      Add-PcbRow 'r' 'bcd backup' 'present' 'present' ('FAIL: ' + $_.Exception.Message) | Out-Null
+    }
+  }
+
+  $gameFile = Get-PcbGamePath
+  try {
+    if (Test-Path -LiteralPath $gameFile) { Remove-Item -LiteralPath $gameFile -Force -ErrorAction Stop }
+    Add-PcbRow 'r' 'game.json' 'present' 'absent' 'OK' | Out-Null
+  } catch {
+    Add-PcbRow 'r' 'game.json' 'present' 'present' ('FAIL: ' + $_.Exception.Message) | Out-Null
+  }
+  return 0
+}
+
+# ===========================================================================
+# main
+# ===========================================================================
+
+function Invoke-PcbMain {
+  $script:PcbDryRun = [bool]$DryRun
+  $script:PcbSelfPath = $null
+  $script:PcbMode = 'apply'
+  if ($Revert) { $script:PcbMode = 'revert' }
+
+  # The boot seams have to exist before any boot helper is called, so they are set here
+  # rather than at each call site.
+  Initialize-PcbBootSeams
+
+  # --- game boot mode dispatch ---------------------------------------------
+  # The four mode switches are mutually exclusive with the piecewise apply/revert flow
+  # below, so they return before the state.json gate.  -GameChild is NOT one of them: a
+  # child runs the ordinary apply (or revert) against an already-installed game mode.
+  if ($GameStartup -or $GameLogon) {
+    $script:PcbMode = 'game-task'
+    if ($DryRun) {
+      Write-PcbLine 'dry run: the boot tasks do not run their work under -DryRun'
+      return 0
+    }
+    if ($GameStartup) { return (Invoke-PcbGameStartup) }
+    return (Invoke-PcbGameLogon)
+  }
+  if ($GameBoot -and -not $DryRun) {
+    $script:PcbMode = 'game-boot'
+    return (Invoke-PcbGameInstall)
+  }
+  if ($GameReboot) {
+    $script:PcbMode = 'game-reboot'
+    if ($DryRun) {
+      Write-PcbLine 'dry run: the icon only arms a restart, nothing to show'
+      return 0
+    }
+    return (Invoke-PcbGameRebootRun)
+  }
+  # -DryRun -GameBoot keeps the ordinary plan rows and appends the boot rows to them: the
+  # caller wants to see the whole picture, not just half of it.  Nothing is written.
+  $gameBootPlan = [bool]($GameBoot -and $DryRun)
+  if ($gameBootPlan) { $script:PcbMode = 'game-boot-dry' }
+
+  $stateFile = Join-Path $StateDir 'state.json'
+  $haveState = Test-Path -LiteralPath $stateFile
+  $gameFile = Get-PcbGamePath
+  $haveGame = Test-Path -LiteralPath $gameFile
+
+  # Plain apply while game boot mode is installed: the icon is the way in, because only it
+  # knows to arm the game entry.  A -GameChild apply is the logon task and is allowed, and
+  # a dry run never applies anything, so it stays free to show the plan.
+  if (-not $Revert -and -not $DryRun -and $haveGame -and -not $GameChild) {
+    Write-PcbLine 'game boot mode is installed: use the desktop icon, or REVERT first'
+    Write-PcbLine ('game file: ' + $gameFile)
+    return 1
+  }
+
+  # REVERT while game boot mode is installed is the uninstall: the live set comes off first
+  # (if it is on), then the entry, the tasks, the icon, the backup and game.json.  From
+  # inside the game boot the entry itself is what has to survive, so that case refuses.
+  $script:PcbGameTeardown = $false
+  $script:PcbGameObject = $null
+  if ($Revert -and $haveGame -and -not $GameChild) {
+    $game = Read-PcbGame
+    if ($null -eq $game) {
+      Write-PcbLine ('game.json is unreadable: ' + $gameFile)
+      return 1
+    }
+    $gameId = [string](Get-PcbStateField $game 'GameId')
+    $booted = Get-PcbBootedId
+    if ($gameId -ne '' -and $booted -ne '' -and $booted -ieq $gameId) {
+      Write-PcbLine 'in GAME mode: restart normally, then run REVERT'
+      Write-PcbLine ('booted id: ' + $booted)
+      return 1
+    }
+    $script:PcbGameTeardown = $true
+    $script:PcbGameObject = $game
+  }
+
+  if (-not $Revert) {
+    if ($haveState) {
+      Write-PcbLine 'already applied, run REVERT first'
+      Write-PcbLine ('state file: ' + $stateFile)
+      return 1
+    }
+  } else {
+    if (-not $haveState -and -not $script:PcbGameTeardown) {
+      Write-PcbLine 'nothing to revert (no state.json)'
+      return 1
+    }
+  }
+
+  # A -DryRun writes nothing, so it must not create the state directory either: a plain
+  # `check.ps1` on a fresh PC has to leave no ProgramData\pcbang-tune behind.
+  if (-not (Test-Path -LiteralPath $StateDir)) {
+    if (-not $DryRun) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
+  }
+
+  if ($DryRun) {
+    $script:PcbState = @{}
+  } elseif ($haveState) {
+    $obj = $null
+    try { $obj = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json } catch { $obj = $null }
+    $script:PcbState = @{}
+    if ($null -ne $obj) {
+      foreach ($p in $obj.PSObject.Properties) { $script:PcbState[$p.Name] = $p.Value }
+    }
+  } else {
+    # uninstall with no live set: game boot mode was installed but never applied
+    $script:PcbState = @{}
+  }
+
+  $masks = Get-PcbMasks
+
+  # Test-only redirect of the LoL cfg step (src\lolcfg.ps1:22 owns the real override).
+  # Set before any step runs so both the apply and the revert path see the same dir.
+  if (-not [string]::IsNullOrWhiteSpace($LolCfgDir)) {
+    $script:PcbLolCfgDir = $LolCfgDir
+  }
+
+  if (-not $Revert) {
+    # real run only: keep a self copy next to the state so the watcher never depends on
+    # the medium the kit was launched from (step c2 can bounce a USB stick off the bus)
+    $script:PcbSelfPath = $null
+    if (-not $DryRun -and -not $WatcherLoop) {
+      try {
+        $selfCopy = Join-Path $StateDir 'pcbang.ps1'
+        $selfSrc = $PSCommandPath
+        if ($selfSrc -and (Test-Path -LiteralPath $selfSrc)) {
+          Copy-Item -LiteralPath $selfSrc -Destination $selfCopy -Force -ErrorAction Stop
+          if (Test-Path -LiteralPath $selfCopy) { $script:PcbSelfPath = $selfCopy }
+        }
+      } catch { $script:PcbSelfPath = $null }
+    }
+    Invoke-PcbStepUsb
+    Write-PcbLine ('masks: game=' + (Format-PcbMask $masks.GameMask) + ' side=' + (Format-PcbMask $masks.SideMask) + ' irq=' + (Format-PcbMask $masks.IrqMask))
+    Invoke-PcbStepPower -Masks $masks
+    Invoke-PcbStepDisplay
+    Invoke-PcbStepNic -Masks $masks
+    Invoke-PcbStepIrq -Masks $masks
+    Invoke-PcbStepRegistry
+    Invoke-PcbStepLolCfg
+    Invoke-PcbStepMouse
+    Invoke-PcbStepServices
+    Invoke-PcbStepTasks
+    Invoke-PcbStepNvidia
+    Invoke-PcbStepGpuClock
+    Invoke-PcbStepWatcher -Masks $masks
+  } else {
+    Restore-PcbWatcher
+    Restore-PcbGpuClockStep
+    Restore-PcbNvidia
+    Restore-PcbTasks
+    Restore-PcbServices
+    Restore-PcbMouse
+    Restore-PcbLolCfgStep
+    Restore-PcbRegistry
+    Restore-PcbDxPrefs
+    Restore-PcbIrq
+    # step c applies netsh, then NIC writes, then UDP last; revert goes back the other way
+    Restore-PcbNicUdp
+    Restore-PcbNic
+    Restore-PcbDisplay
+    Restore-PcbPower
+    $watcherJson = Join-Path $StateDir 'watcher.json'
+    if (Test-Path -LiteralPath $watcherJson) { Remove-Item -LiteralPath $watcherJson -Force -ErrorAction SilentlyContinue }
+  }
+
+  # Uninstall tail: only after the live set came off.  The rows for the entry, the tasks,
+  # the icon and game.json land in the same report.
+  if ($Revert -and $script:PcbGameTeardown) {
+    [void](Invoke-PcbGameTeardown $script:PcbGameObject)
+  }
+  # -DryRun -GameBoot: the boot rows ride along after the ordinary plan rows.
+  if ($gameBootPlan) {
+    Add-PcbGameDryRows
+    Write-PcbLine ('shortcut file name char codes: ' + (Get-PcbGameIconCodesText))
+  }
+
+  Write-PcbReport
+
+  if ($Revert) {
+    if (-not $DryRun) {
+      if (Test-Path -LiteralPath $stateFile) { Remove-Item -LiteralPath $stateFile -Force -ErrorAction SilentlyContinue }
+      if ($script:PcbGameTeardown) { Write-PcbLine 'revert complete, game boot mode removed' }
+      else { Write-PcbLine 'revert complete, state.json removed' }
+    }
+  } elseif ($DryRun) {
+    Write-PcbLine 'dry run complete: nothing was changed'
+  } else {
+    Write-PcbLine 'apply complete'
+    # step c pins the input controllers by USB port instance id; a different port is a
+    # different device, so the pins have to be redone from a clean state.
+    Write-PcbLine 'If you plug the mouse or keyboard into another USB port, run REVERT, then RUN again.'
+  }
+  # An elevated console closes the moment this script returns, taking the report with
+  # it.  Hold the window open unless it is a test (-NoPause) or a background helper.
+  if (-not $NoPause -and -not $WatcherLoop -and -not $DotSource) {
+    Write-PcbLine ''
+    Write-PcbLine 'Press Enter to close'
+    try { [void][Console]::In.ReadLine() } catch { }
+  }
+  return 0
+}
+
+# --- entry -----------------------------------------------------------------
+
+if ($DotSource) { return }
+
+# -GameBoot carries the caller's own switches into the two tasks and into the logon child,
+# so the script-level bound set is frozen here - inside a function $PSBoundParameters would
+# be that function's own (empty) set.
+$script:PcbBoundParams = @{}
+foreach ($k in @($PSBoundParameters.Keys)) { $script:PcbBoundParams[$k] = $PSBoundParameters[$k] }
+
+Initialize-PcbNative -ErrorAction SilentlyContinue
+
+if ($WatcherLoop) {
+  Invoke-PcbWatcherLoop
+  return
+}
+
+# The USB port check only reads the device tree and raw input: no admin rights, no lock, no
+# state, so it runs here, before the self-elevation below.
+if ($UsbScan) {
+  $usbArgs = @{}
+  if ($UsbScanTestSec -gt 0) { $usbArgs['TestMode'] = $true; $usbArgs['AutoCloseSec'] = $UsbScanTestSec }
+  if ($UsbScanShot -ne '') { $usbArgs['ShotPath'] = $UsbScanShot }
+  $usbRes = Show-PcbUsbScan @usbArgs
+  if ($UsbScanTestSec -gt 0) { Write-Output ('usbscan register=' + [string]$usbRes.RegisterOk + ' err=' + [string]$usbRes.RegisterError + ' shot=' + [string]$usbRes.Shot) }
+  exit 0
+}
+
+$PcbIsAdmin = $false
+try {
+  $PcbIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $PcbIsAdmin = $false }
+
+if (-not $PcbIsAdmin -and -not $DryRun) {
+  $parts = New-Object System.Collections.ArrayList
+  foreach ($k in @($PSBoundParameters.Keys)) {
+    if (@('WatcherLoop','GameMask','SideMask','DotSource','Revert','DryRun','BootedId') -contains $k) {
+      if ($k -eq 'Revert' -or $k -eq 'DryRun') { [void]$parts.Add('-' + $k) }
+      continue
+    }
+    $v = $PSBoundParameters[$k]
+    if ($v -is [switch] -or $v -is [bool]) {
+      if ($v) { [void]$parts.Add('-' + $k) }
+      continue
+    }
+    if ($v -is [array]) {
+      [void]$parts.Add('-' + $k)
+      [void]$parts.Add((($v | ForEach-Object { '"' + ([string]$_ -replace '"', '') + '"' }) -join ','))
+      continue
+    }
+    [void]$parts.Add('-' + $k)
+    [void]$parts.Add('"' + ([string]$v -replace '"', '') + '"')
+  }
+  $argLine = ($parts -join ' ')
+  $spArgs = @{
+    FilePath = 'powershell.exe'
+    Verb = 'RunAs'
+    ArgumentList = ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $PSCommandPath, $argLine)
+  }
+  # W-GUI1: the window mode relaunches itself elevated too, and that relaunch must not
+  # flash a console over the game.  Every other mode keeps its visible console.
+  if ($Gui) { $spArgs['WindowStyle'] = 'Hidden' }
+  try {
+    Start-Process @spArgs | Out-Null
+  } catch {
+    Write-PcbLine ('elevation failed: ' + $_.Exception.Message)
+    exit 1
+  }
+  exit 0
+}
+
+if ($Gui) {
+  $rc = Show-PcbGui -Self $PSCommandPath -TestSec $GuiTestSec -ShotPath $GuiShot -TestAction $GuiTestAction -LogOut $GuiLogOut
+  exit $rc
+}
+
+$rc = Invoke-PcbMain
+exit $rc

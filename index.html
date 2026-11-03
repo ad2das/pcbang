@@ -14,13 +14,27 @@
   button.ok { background: #d8f5d8; }
   .note { color: #555; font-size: .92rem; }
   ul { padding-left: 1.2rem; }
+  a.dl { display: inline-block; background: #1a6fd1; color: #fff; text-decoration: none; border-radius: 8px; padding: .7rem 1.4rem; font-size: 1.05rem; font-weight: bold; }
+  a.dl:hover { background: #155bb0; }
 </style>
 </head>
 <body>
 <h1>PC방 롤(LoL) 지연 최적화</h1>
-<p class="note">두 가지가 있습니다: 재부팅 없이 바로 적용(PC방용) / 게임 부팅 모드(재부팅 항목까지 전부, 사무용 PC용). 어느 쪽이든 전부 원복할 수 있습니다.</p>
+<p class="note">두 가지가 있습니다: 재부팅 없이 바로 적용(PC방용) / 게임 부팅 모드(재부팅 항목까지 전부, 사무용 PC용). 어느 쪽이든 전부 원복할 수 있습니다. 롤은 <b>게임(인게임)을 켜기 전에</b> 실행하세요.</p>
 
-<h2>쓰는 법</h2>
+<h2>가장 쉬운 방법: 창으로 실행</h2>
+<p><a class="dl" href="pcbang.cmd" download="pcbang.cmd">pcbang.cmd 다운로드</a></p>
+<ul>
+  <li>받은 <b>pcbang.cmd</b>를 더블클릭 → 관리자 권한 창에서 <b>예</b>. 키트를 받아 검증한 뒤 창이 열립니다.</li>
+  <li>브라우저가 "흔하지 않은 파일"이라고 막으면 <b>유지</b>(또는 ⋯ → 유지)를 누르세요. Windows가 "게시자를 확인할 수 없습니다"라고 물으면 <b>실행</b>.</li>
+  <li>창의 버튼: <b>적용 (PC방, 재부팅 없음)</b> · <b>점검만</b> · <b>게임 부팅 모드 설치 (내 PC)</b> · <b>게임 모드로 재부팅</b> · <b>원복</b> · <b>USB 포트 확인</b>. 지금 상태에서 못 쓰는 버튼은 회색으로 잠깁니다.</li>
+  <li>버튼을 누르면 진행 기록이 창 안에 나오고, 끝나면 "완료 - 성공 N, 건너뜀 N, 실패 N" 한 줄로 결과를 보여 줍니다.</li>
+  <li>게임 부팅 모드: 설치는 처음 한 번만. 게임할 때마다 <b>게임 모드로 재부팅</b>(창 버튼 또는 바탕화면 아이콘). 그냥 재부팅하면 일반 모드로 돌아옵니다.</li>
+</ul>
+<p class="note">다운로드가 막힌 PC라면 아래 한 줄을 터미널에 붙여넣어도 같은 창이 열립니다.</p>
+<div class="cmd"><code class="line" id="c6">[Net.ServicePointManager]::SecurityProtocol=3072; irm https://ad2das.github.io/pcbang/gui.ps1 | iex</code><button data-t="c6">복사</button></div>
+
+<h2>한 줄 명령으로 실행 (고급)</h2>
 <ul>
   <li><b>Win + X</b> → <b>터미널</b>(또는 Windows PowerShell)을 엽니다.</li>
   <li>아래 줄을 복사해서 붙여넣고 Enter. 관리자 권한 창이 뜨면 <b>예</b>를 누릅니다.</li>
